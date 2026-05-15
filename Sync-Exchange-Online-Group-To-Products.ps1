@@ -473,27 +473,27 @@ catch {
 try {
     # Microsoft docs: https://learn.microsoft.com/en-us/powershell/module/exchange/add-distributiongroupmember?view=exchange-ps
     $addPermissionSplatParams = @{
-        Identity                        = $exchangeDistributionGroup
-        Member                          = $exchangeUser
+        Identity                        = $exchangeDistributionGroup.guid
+        Member                          = $exchangeUser.guid
         BypassSecurityGroupManagerCheck = $true
         Confirm                         = $false
         Verbose                         = $false
         ErrorAction                     = "Stop"
     }
 
-    Write-Verbose "Granting permission for user [$($addPermissionSplatParams.Member.DisplayName)] to distribution group [$($addPermissionSplatParams.Identity.DisplayName)]"
+    Write-Verbose "Granting permission for user [$($exchangeUser.DisplayName)] to distribution group [$($exchangeDistributionGroup.DisplayName)]"
 
     $addPermission = Add-DistributionGroupMember @addPermissionSplatParams
 
-    Write-Information "Successfully granted permission for user [$($addPermissionSplatParams.Member.DisplayName)] to distribution group [$($addPermissionSplatParams.Identity.DisplayName)]"
+    Write-Information "Successfully granted permission for user [$($exchangeUser.DisplayName)] to distribution group [$($exchangeDistributionGroup.DisplayName)]"
 
     $Log = @{
         Action            = "GrantMembership" # optional. ENUM (undefined = default) 
         System            = "ExchangeOnline" # optional (free format text) 
-        Message           = "Successfully granted permission for user [$($addPermissionSplatParams.Member.DisplayName)] to distribution group [$($addPermissionSplatParams.Identity.DisplayName)]" # required (free format text) 
+        Message           = "Successfully granted permission for user [$($exchangeUser.DisplayName)] to distribution group [$($exchangeDistributionGroup.DisplayName)]" # required (free format text) 
         IsError           = $false # optional. Elastic reporting purposes only. (default = $false. $true = Executed action returned an error) 
-        TargetDisplayName = $addPermissionSplatParams.Member.DisplayName # optional (free format text)
-        TargetIdentifier  = $addPermissionSplatParams.Member.Identity # optional (free format text)
+        TargetDisplayName = $exchangeUser.DisplayName # optional (free format text)
+        TargetIdentifier  = $([string]$exchangeUser.Guid) # optional (free format text)
     }
     #send result back  
     Write-Information -Tags "Audit" -MessageData $log
@@ -503,15 +503,15 @@ catch {
     $errorMessage = Get-ErrorMessage -ErrorObject $ex
         
     if ($errorMessage.AuditErrorMessage -like "*Microsoft.Exchange.Management.Tasks.MemberAlreadyExistsException*") {
-        Write-Information "User [$($addPermissionSplatParams.Member.DisplayName)] is already member of distribution group [$($addPermissionSplatParams.Identity.DisplayName)]"
+        Write-Information "User [$($exchangeUser.DisplayName)] is already member of distribution group [$($exchangeDistributionGroup.DisplayName)]"
 
         $Log = @{
             Action            = "GrantMembership" # optional. ENUM (undefined = default) 
             System            = "ExchangeOnline" # optional (free format text) 
-            Message           = "User [$($addPermissionSplatParams.Member.DisplayName)] is already member of distribution group [$($addPermissionSplatParams.Identity.DisplayName)]" # required (free format text) 
+            Message           = "User [$($exchangeUser.DisplayName)] is already member of distribution group [$($exchangeDistributionGroup.DisplayName)]" # required (free format text) 
             IsError           = $false # optional. Elastic reporting purposes only. (default = $false. $true = Executed action returned an error) 
-            TargetDisplayName = $addPermissionSplatParams.Member.DisplayName # optional (free format text)
-            TargetIdentifier  = $addPermissionSplatParams.Member.Identity # optional (free format text)
+            TargetDisplayName = $exchangeUser.DisplayName # optional (free format text)
+            TargetIdentifier  = $([string]$exchangeUser.Guid) # optional (free format text)
         }
         #send result back  
         Write-Information -Tags "Audit" -MessageData $log
@@ -522,15 +522,15 @@ catch {
         $Log = @{
             Action            = "GrantMembership" # optional. ENUM (undefined = default) 
             System            = "ExchangeOnline" # optional (free format text) 
-            Message           = "Error granting permission for user [$($addPermissionSplatParams.Member.DisplayName)] to distribution group [$($addPermissionSplatParams.Identity.DisplayName)]. Error Message: $($errorMessage.AuditErrorMessage)" # required (free format text) 
+            Message           = "Error granting permission for user [$($exchangeUser.DisplayName)] to distribution group [$($exchangeDistributionGroup.DisplayName)]. Error Message: $($errorMessage.AuditErrorMessage)" # required (free format text) 
             IsError           = $true # optional. Elastic reporting purposes only. (default = $false. $true = Executed action returned an error) 
-            TargetDisplayName = $addPermissionSplatParams.Member.DisplayName # optional (free format text)
-            TargetIdentifier  = $addPermissionSplatParams.Member.Identity # optional (free format text)
+            TargetDisplayName = $exchangeUser.DisplayName # optional (free format text)
+            TargetIdentifier  = $([string]$exchangeUser.Guid) # optional (free format text)
         }
         #send result back  
         Write-Information -Tags "Audit" -MessageData $log
 
-        throw "Error granting permission for user [$($addPermissionSplatParams.Member.DisplayName)] to distribution group [$($addPermissionSplatParams.Identity.DisplayName)]. Error Message: $($errorMessage.AuditErrorMessage)"
+        throw "Error granting permission for user [$($exchangeUser.DisplayName)] to distribution group [$($exchangeDistributionGroup.DisplayName)]. Error Message: $($errorMessage.AuditErrorMessage)"
     }
 }
 '@
@@ -751,8 +751,8 @@ catch {
 try {
     # Microsoft docs: https://learn.microsoft.com/en-us/powershell/module/exchange/remove-distributiongroupmember?view=exchange-ps
     $removePermissionSplatParams = @{
-        Identity                        = $exchangeDistributionGroup
-        Member                          = $exchangeUser
+        Identity                        = $exchangeDistributionGroup.guid
+        Member                          = $exchangeUser.guid
         BypassSecurityGroupManagerCheck = $true
         Confirm                         = $false
         Verbose                         = $false
@@ -763,15 +763,15 @@ try {
 
     $removePermission = Remove-DistributionGroupMember @removePermissionSplatParams
 
-    Write-Information "Successfully revoked permission for user [$($removePermissionSplatParams.Member.DisplayName)] to distribution group [$($removePermissionSplatParams.Identity.DisplayName)]"
+    Write-Information "Successfully revoked permission for user [$($exchangeUser.DisplayName)] to distribution group [$($exchangeDistributionGroup.DisplayName)]"
 
     $Log = @{
         Action            = "RevokeMembership" # optional. ENUM (undefined = default) 
         System            = "ExchangeOnline" # optional (free format text) 
-        Message           = "Successfully revoked permission for user [$($removePermissionSplatParams.Member.DisplayName)] to distribution group [$($removePermissionSplatParams.Identity.DisplayName)]" # required (free format text) 
+        Message           = "Successfully revoked permission for user [$($exchangeUser.DisplayName)] to distribution group [$($exchangeDistributionGroup.DisplayName)]" # required (free format text) 
         IsError           = $false # optional. Elastic reporting purposes only. (default = $false. $true = Executed action returned an error) 
-        TargetDisplayName = $removePermissionSplatParams.Member.DisplayName # optional (free format text)
-        TargetIdentifier  = $removePermissionSplatParams.Member.Identity # optional (free format text)
+        TargetDisplayName = $exchangeUser.DisplayName # optional (free format text)
+        TargetIdentifier  = $([string]$exchangeUser.Guid) # optional (free format text)
     }
     #send result back  
     Write-Information -Tags "Audit" -MessageData $log
@@ -781,29 +781,29 @@ catch {
     $errorMessage = Get-ErrorMessage -ErrorObject $ex
 
     if ($errorMessage.AuditErrorMessage -like "*Microsoft.Exchange.Management.Tasks.MemberNotFoundException*") {
-        Write-Information "User [$($removePermissionSplatParams.Member.DisplayName)] is already removed from distribution group [$($removePermissionSplatParams.Identity.DisplayName)]"
+        Write-Information "User [$($exchangeUser.DisplayName)] is already removed from distribution group [$($exchangeDistributionGroup.DisplayName)]"
 
         $Log = @{
             Action            = "RevokeMembership" # optional. ENUM (undefined = default) 
             System            = "ExchangeOnline" # optional (free format text) 
-            Message           = "User [$($removePermissionSplatParams.Member.DisplayName)] is already removed from distribution group [$($removePermissionSplatParams.Identity.DisplayName)]" # required (free format text) 
+            Message           = "User [$($exchangeUser.DisplayName)] is already removed from distribution group [$($exchangeDistributionGroup.DisplayName)]" # required (free format text) 
             IsError           = $false # optional. Elastic reporting purposes only. (default = $false. $true = Executed action returned an error) 
-            TargetDisplayName = $removePermissionSplatParams.Member.DisplayName # optional (free format text)
-            TargetIdentifier  = $removePermissionSplatParams.Member.Identity # optional (free format text)
+            TargetDisplayName = $exchangeUser.DisplayName # optional (free format text)
+            TargetIdentifier  = $([string]$exchangeUser.Guid) # optional (free format text)
         }
         #send result back  
         Write-Information -Tags "Audit" -MessageData $log
     } 
     elseif ($errorMessage.AuditErrorMessage -like "*Microsoft.Exchange.Configuration.Tasks.ManagementObjectNotFoundException*") {
-        Write-Information "Distribution group [$($removePermissionSplatParams.Identity.DisplayName)] no longer exists. Skipped action"
+        Write-Information "Distribution group [$($exchangeDistributionGroup.DisplayName)] no longer exists. Skipped action"
 
         $Log = @{
             Action            = "RevokeMembership" # optional. ENUM (undefined = default) 
             System            = "ExchangeOnline" # optional (free format text) 
-            Message           = "Distribution group [$($removePermissionSplatParams.Identity.DisplayName)] no longer exists. Skipped action" # required (free format text) 
+            Message           = "Distribution group [$($exchangeDistributionGroup.DisplayName)] no longer exists. Skipped action" # required (free format text) 
             IsError           = $false # optional. Elastic reporting purposes only. (default = $false. $true = Executed action returned an error) 
-            TargetDisplayName = $removePermissionSplatParams.Member.DisplayName # optional (free format text)
-            TargetIdentifier  = $removePermissionSplatParams.Member.Identity # optional (free format text)
+            TargetDisplayName = $exchangeUser.DisplayName # optional (free format text)
+            TargetIdentifier  = $([string]$exchangeUser.Guid) # optional (free format text)
         }
         #send result back  
         Write-Information -Tags "Audit" -MessageData $log
@@ -814,15 +814,15 @@ catch {
         $Log = @{
             Action            = "RevokeMembership" # optional. ENUM (undefined = default) 
             System            = "ExchangeOnline" # optional (free format text) 
-            Message           = "Error revoking permission for user [$($removePermissionSplatParams.Member.DisplayName)] to distribution group [$($removePermissionSplatParams.Identity.DisplayName)]. Error Message: $($errorMessage.AuditErrorMessage)" # required (free format text) 
+            Message           = "Error revoking permission for user [$($exchangeUser.DisplayName)] to distribution group [$($exchangeDistributionGroup.DisplayName)]. Error Message: $($errorMessage.AuditErrorMessage)" # required (free format text) 
             IsError           = $true # optional. Elastic reporting purposes only. (default = $false. $true = Executed action returned an error) 
-            TargetDisplayName = $removePermissionSplatParams.Member.DisplayName # optional (free format text)
-            TargetIdentifier  = $removePermissionSplatParams.Member.Identity # optional (free format text)
+            TargetDisplayName = $exchangeUser.DisplayName # optional (free format text)
+            TargetIdentifier  = $([string]$exchangeUser.Guid) # optional (free format text)
         }
         #send result back  
         Write-Information -Tags "Audit" -MessageData $log
 
-        throw "Error revoking permission for user [$($removePermissionSplatParams.Member.DisplayName)] to distribution group [$($removePermissionSplatParams.Identity.DisplayName)]. Error Message: $($errorMessage.AuditErrorMessage)"
+        throw "Error revoking permission for user [$($exchangeUser.DisplayName)] to distribution group [$($exchangeDistributionGroup.DisplayName)]. Error Message: $($errorMessage.AuditErrorMessage)"
     }
 }
 '@
