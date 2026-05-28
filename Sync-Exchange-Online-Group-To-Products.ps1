@@ -1,7 +1,7 @@
 #####################################################
 # HelloID-Conn-SA-Sync-Exchange-Online-DistributionGroup-To-SelfService-Products
 #
-# Version: 2.0.1
+# Version: 2.1.3
 #####################################################
 $VerbosePreference = "SilentlyContinue"
 $informationPreference = "Continue"
@@ -21,11 +21,12 @@ $verboseLogging = $false
 # $portalApiKey = "" # Set from Global Variable
 # $portalApiSecret = "" # Set from Global Variable
 
-# Exchange Online Connection Configuration
-# $EntraOrganization = "" # Set from Global Variable
-# $EntraTenantID = "" # Set from Global Variable
-# $EntraAppID = "" # Set from Global Variable
-# $EntraAppSecret = "" # Set from Global Variable
+# Exchange Online connection (required)
+# $EntraIdOrganization = "" # Set from Global Variable
+# $EntraIdAppId = "" # Set from Global Variable
+# $EntraIdCertificateBase64String = "" # Set from Global Variable
+# $EntraIdCertificatePassword = "" # Set from Global Variable
+
 $exchangeGroupsFilter = "DisplayName -like 'DistributionGroup*'" # Optional, when no filter is provided ($exchangeGroupsFilter = $null), all groups will be queried
 
 # PowerShell commands to import
@@ -255,6 +256,29 @@ function Invoke-HIDRestmethod {
         throw $_
     }
 }
+
+function Get-MSEntraCertificate {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [string]
+        $CertificateBase64String,
+        
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [string]
+        $CertificatePassword
+    )
+    try {
+        $rawCertificate = [system.convert]::FromBase64String($CertificateBase64String)
+        $certificate = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($rawCertificate, $CertificatePassword, [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::Exportable)
+        Write-Output $certificate
+    }
+    catch {
+        $PSCmdlet.ThrowTerminatingError($_)
+    }
+}
 #endregion functions
 
 #region HelloId_Actions_Variables
@@ -269,11 +293,11 @@ $addPermissionScript = $addPermissionScript + @'
 $User = $request.requestedFor.userName
 $AutoMapping = $true
 
-# Exchange Online Connection Configuration
-# $EntraOrganization = "" # Set from Global Variable
-# $EntraTenantID = "" # Set from Global Variable
-# $EntraAppID = "" # Set from Global Variable
-# $EntraAppSecret = "" # Set from Global Variable
+# Exchange Online connection (required)
+# $EntraIdOrganization = "" # Set from Global Variable
+# $EntraIdAppId = "" # Set from Global Variable
+# $EntraIdCertificateBase64String = "" # Set from Global Variable
+# $EntraIdCertificatePassword = "" # Set from Global Variable
 
 # PowerShell commands to import
 $commands = @(
@@ -354,6 +378,29 @@ function Get-ErrorMessage {
         Write-Output $errorMessage
     }
 }
+
+function Get-MSEntraCertificate {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [string]
+        $CertificateBase64String,
+        
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [string]
+        $CertificatePassword
+    )
+    try {
+        $rawCertificate = [system.convert]::FromBase64String($CertificateBase64String)
+        $certificate = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($rawCertificate, $CertificatePassword, [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::Exportable)
+        Write-Output $certificate
+    }
+    catch {
+        $PSCmdlet.ThrowTerminatingError($_)
+    }
+}
 #endregion functions
 
 # Import module
@@ -372,36 +419,28 @@ catch {
 
 # Connect to Exchange
 try {
-    # Create access token
-    Write-Verbose "Creating Access Token"
+    # Convert base64 certificate string to certificate object
+    $certificate = Get-MSEntraCertificate -CertificateBase64String $EntraIdCertificateBase64String -CertificatePassword $EntraIdCertificatePassword
 
-    $baseUri = "https://login.microsoftonline.com/"
-    $authUri = $baseUri + "$EntraTenantID/oauth2/token"
-  
-    $body = @{
-        grant_type    = "client_credentials"
-        client_id     = "$EntraAppID"
-        client_secret = "$EntraAppSecret"
-        resource      = "https://outlook.office365.com"
+    Write-Verbose "Converted base64 certificate string to certificate object"
+
+    # Connect to Microsoft Exchange Online
+    # Docs: https://learn.microsoft.com/en-us/powershell/module/exchange/connect-exchangeonline?view=exchange-ps
+
+    $createExchangeSessionSplatParams = @{
+        Organization          = $EntraIdOrganization
+        AppID                 = $EntraIdAppId
+        Certificate           = $certificate
+        CommandName           = $commands
+        ShowBanner            = $false
+        ShowProgress          = $false
+        TrackPerformance      = $false
+        SkipLoadingCmdletHelp = $true
+        SkipLoadingFormatData = $true
+        ErrorAction           = "Stop"
     }
-  
-    $Response = Invoke-RestMethod -Method POST -Uri $authUri -Body $body -ContentType "application/x-www-form-urlencoded" -UseBasicParsing:$true
-    $accessToken = $Response.access_token
 
-    # Connect to Exchange Online in an unattended scripting scenario using an access token.
-    Write-Verbose "Connecting to Exchange Online"
-
-    $exchangeSessionParams = @{
-        Organization     = $EntraOrganization
-        AppID            = $EntraAppID
-        AccessToken      = $accessToken
-        CommandName      = $commands
-        ShowBanner       = $false
-        ShowProgress     = $false
-        TrackPerformance = $false
-        ErrorAction      = "Stop"
-    }
-    $exchangeSession = Connect-ExchangeOnline @exchangeSessionParams
+    $null = Connect-ExchangeOnline @createExchangeSessionSplatParams
   
     Write-Information "Successfully connected to Exchange Online"
 }
@@ -547,11 +586,11 @@ $removePermissionScript = $removePermissionScript + @'
 $User = $request.requestedFor.userName
 $AutoMapping = $true
 
-# Exchange Online Connection Configuration
-# $EntraOrganization = "" # Set from Global Variable
-# $EntraTenantID = "" # Set from Global Variable
-# $EntraAppID = "" # Set from Global Variable
-# $EntraAppSecret = "" # Set from Global Variable
+# Exchange Online connection (required)
+# $EntraIdOrganization = "" # Set from Global Variable
+# $EntraIdAppId = "" # Set from Global Variable
+# $EntraIdCertificateBase64String = "" # Set from Global Variable
+# $EntraIdCertificatePassword = "" # Set from Global Variable
 
 # PowerShell commands to import
 $commands = @(
@@ -632,6 +671,29 @@ function Get-ErrorMessage {
         Write-Output $errorMessage
     }
 }
+
+function Get-MSEntraCertificate {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [string]
+        $CertificateBase64String,
+        
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [string]
+        $CertificatePassword
+    )
+    try {
+        $rawCertificate = [system.convert]::FromBase64String($CertificateBase64String)
+        $certificate = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($rawCertificate, $CertificatePassword, [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::Exportable)
+        Write-Output $certificate
+    }
+    catch {
+        $PSCmdlet.ThrowTerminatingError($_)
+    }
+}
 #endregion functions
 
 # Import module
@@ -650,36 +712,28 @@ catch {
 
 # Connect to Exchange
 try {
-    # Create access token
-    Write-Verbose "Creating Access Token"
+    # Convert base64 certificate string to certificate object
+    $certificate = Get-MSEntraCertificate -CertificateBase64String $EntraIdCertificateBase64String -CertificatePassword $EntraIdCertificatePassword
 
-    $baseUri = "https://login.microsoftonline.com/"
-    $authUri = $baseUri + "$EntraTenantID/oauth2/token"
-  
-    $body = @{
-        grant_type    = "client_credentials"
-        client_id     = "$EntraAppID"
-        client_secret = "$EntraAppSecret"
-        resource      = "https://outlook.office365.com"
+    Write-Verbose "Converted base64 certificate string to certificate object"
+
+    # Connect to Microsoft Exchange Online
+    # Docs: https://learn.microsoft.com/en-us/powershell/module/exchange/connect-exchangeonline?view=exchange-ps
+
+    $createExchangeSessionSplatParams = @{
+        Organization          = $EntraIdOrganization
+        AppID                 = $EntraIdAppId
+        Certificate           = $certificate
+        CommandName           = $commands
+        ShowBanner            = $false
+        ShowProgress          = $false
+        TrackPerformance      = $false
+        SkipLoadingCmdletHelp = $true
+        SkipLoadingFormatData = $true
+        ErrorAction           = "Stop"
     }
-  
-    $Response = Invoke-RestMethod -Method POST -Uri $authUri -Body $body -ContentType "application/x-www-form-urlencoded" -UseBasicParsing:$true
-    $accessToken = $Response.access_token
 
-    # Connect to Exchange Online in an unattended scripting scenario using an access token.
-    Write-Verbose "Connecting to Exchange Online"
-
-    $exchangeSessionParams = @{
-        Organization     = $EntraOrganization
-        AppID            = $EntraAppID
-        AccessToken      = $accessToken
-        CommandName      = $commands
-        ShowBanner       = $false
-        ShowProgress     = $false
-        TrackPerformance = $false
-        ErrorAction      = "Stop"
-    }
-    $exchangeSession = Connect-ExchangeOnline @exchangeSessionParams
+    $null = Connect-ExchangeOnline @createExchangeSessionSplatParams
   
     Write-Information "Successfully connected to Exchange Online"
 }
@@ -849,37 +903,29 @@ catch {
 
 # Connect to Exchange
 try {
-    # Create access token
-    Write-Verbose "Creating Access Token"
+    # Convert base64 certificate string to certificate object
+    $certificate = Get-MSEntraCertificate -CertificateBase64String $EntraIdCertificateBase64String -CertificatePassword $EntraIdCertificatePassword
 
-    $baseUri = "https://login.microsoftonline.com/"
-    $authUri = $baseUri + "$EntraTenantID/oauth2/token"
-    
-    $body = @{
-        grant_type    = "client_credentials"
-        client_id     = "$EntraAppID"
-        client_secret = "$EntraAppSecret"
-        resource      = "https://outlook.office365.com"
+    Write-Verbose "Converted base64 certificate string to certificate object"
+
+    # Connect to Microsoft Exchange Online
+    # Docs: https://learn.microsoft.com/en-us/powershell/module/exchange/connect-exchangeonline?view=exchange-ps
+
+    $createExchangeSessionSplatParams = @{
+        Organization          = $EntraIdOrganization
+        AppID                 = $EntraIdAppId
+        Certificate           = $certificate
+        CommandName           = $commands
+        ShowBanner            = $false
+        ShowProgress          = $false
+        TrackPerformance      = $false
+        SkipLoadingCmdletHelp = $true
+        SkipLoadingFormatData = $true
+        ErrorAction           = "Stop"
     }
-    
-    $Response = Invoke-RestMethod -Method POST -Uri $authUri -Body $body -ContentType "application/x-www-form-urlencoded" -UseBasicParsing:$true
-    $accessToken = $Response.access_token
 
-    # Connect to Exchange Online in an unattended scripting scenario using an access token.
-    Write-Verbose "Connecting to Exchange Online"
-
-    $exchangeSessionParams = @{
-        Organization     = $EntraOrganization
-        AppID            = $EntraAppID
-        AccessToken      = $accessToken
-        CommandName      = $commands
-        ShowBanner       = $false
-        ShowProgress     = $false
-        TrackPerformance = $false
-        ErrorAction      = "Stop"
-    }
-    $exchangeSession = Connect-ExchangeOnline @exchangeSessionParams
-    
+    $null = Connect-ExchangeOnline @createExchangeSessionSplatParams
+  
     Write-Information "Successfully connected to Exchange Online"
 }
 catch {
@@ -893,10 +939,10 @@ catch {
 # Get Exchange Online Distribution Groups
 try {  
     $exchangeQuerySplatParams = @{
-        Filter               = $exchangeGroupsFilter
-        ResultSize           = "Unlimited"
-        Verbose              = $false
-        ErrorAction          = "Stop"
+        Filter      = $exchangeGroupsFilter
+        ResultSize  = "Unlimited"
+        Verbose     = $false
+        ErrorAction = "Stop"
     }
 
     Hid-Write-Status -Event Information -Message "Querying Exchange Online Distribution Groups that match filter [$($exchangeQuerySplatParams.Filter)]"
