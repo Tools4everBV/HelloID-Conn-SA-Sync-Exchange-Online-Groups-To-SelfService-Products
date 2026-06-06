@@ -1,5 +1,13 @@
 # HelloID-Conn-SA-Sync-EXO-Groups-To-SelfService-Products
 
+> [!IMPORTANT]
+> **Best Practice - Maximum Synchronization Frequency: Once per day**
+>
+> **Why this maximum?**
+> New resources are typically created daily or weekly, not hourly. More frequent synchronization causes unnecessary API calls and processing load on both source systems and HelloID without business value.
+>
+> If a higher frequency is required for your organization, please contact **Tools4ever Support**. This helps us understand your use case and provide proper guidance.
+
 > [!IMPORTANT]  
 > This repository contains the connector and configuration code only. The implementer is responsible to acquire the connection details such as username, password, certificate, etc. You might even need to sign a contract or agreement with the supplier before implementing this connector. Please contact the client's application manager to coordinate the connector requirements.
 
