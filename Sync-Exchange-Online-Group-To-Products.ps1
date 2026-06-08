@@ -1330,7 +1330,7 @@ try {
     }
 
     $exchangeOnlineGroups = Get-DistributionGroup @getMicrosoftExchangeOnlineGroupsSplatParams | Select-Object $exchangeOnlineGroupPropertiesToRetrieve
-    Write-StatusMessage -Event Success -Message "Successfully queried Exchange Online groups that match filter [$exchangeOnlineGroupsFilter]. Result count: $(($sourceObjectsInScope | Measure-Object).Count)"
+    Write-StatusMessage -Event Success -Message "Successfully queried Exchange Online groups that match filter [$exchangeOnlineGroupsFilter]. Result count: $(($exchangeOnlineGroups | Measure-Object).Count)"
 
     # Build list of source objects in scope based on query results (to use in further actions)
     $sourceObjectsInScope = [System.Collections.Generic.List[Object]]::New()
