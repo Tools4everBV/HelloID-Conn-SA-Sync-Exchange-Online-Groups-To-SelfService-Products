@@ -1318,7 +1318,6 @@ try {
     # Get Exchange Online Groups
     $actionMessage = "querying Microsoft Exchange Online Groups that match filter [$exchangeOnlineGroupsFilter] and retrieving properties [$($exchangeOnlineGroupPropertiesToRetrieve -join ", ")]"
     $getMicrosoftExchangeOnlineGroupsSplatParams = @{
-        Properties  = $exchangeOnlineGroupPropertiesToRetrieve
         ResultSize  = "Unlimited"
         Verbose     = $false
         ErrorAction = 'Stop'
