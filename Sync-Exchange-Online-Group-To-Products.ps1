@@ -50,7 +50,7 @@ $createThreshold = 10
 # Update Threshold - Maximum number of EXISTING products to update in one run
 # This is a safety limit to prevent accidental mass updates
 # Set to $null for unlimited (not recommended)
-# Note: Only applies when $overwriteExistingProduct = $true
+# Note: Only applies when $overwriteExistingProduct = $true or actions/access groups update is enabled
 $updateThreshold = 10
 
 # Remove Threshold - Maximum number of products to disable/remove in one run
@@ -70,7 +70,7 @@ $removeProductBehavior = "Remove"  # Options: "None", "Disable", "Remove"
 
 # Remove Resource Owner Group when product is removed
 # Only applies when $removeProductBehavior = "Remove" (not when "Disable")
-# Only removes Local groups (AzureAD groups are never removed)
+# Only removes Local groups (synced groups from e.g. AD or Entra ID are never removed)
 # WARNING: This permanently deletes the resource owner group along with the product
 # - If $true: When a product is removed, its resource owner group is also deleted (recommended for "Calculated" mode)
 # - If $false: Resource owner groups are preserved even when products are removed (requires manual cleanup)
@@ -195,10 +195,11 @@ function New-HelloIDProductConfiguration {
     
         # Access Groups - Groups whose members can see AND request these products
         # Format: @("source/groupname", "source/groupname")
-        # - Source can be: "local" (HelloID groups) or "AzureAD" (synced from Azure AD)
+        # - Source can be "local" (HelloID groups) or any other source configured in HelloID
+        # - Check your HelloID configuration to see available sources (e.g., "AzureAD", "ActiveDirectory", etc.)
         # - Use @("local/Users") to give all users access (true self-service)
         # - Use @() (empty array) to limit access to only resource owner/manager
-        # - Use @("AzureAD/IT Department", "local/Administrators") for specific groups
+        # - Use @("AzureAD/IT Department", "local/Administrators") for specific groups from multiple sources
         #
         # IMPORTANT: Each user with access to a product takes a HelloID license!
         # Best practice: Start with @("local/Users") for full self-service
@@ -311,10 +312,10 @@ function New-HelloIDProductConfiguration {
         # Only applies when HasTimeLimit = $true
         LimitType                  = "Maximum"
     
-        # Ownership Max Duration - Maximum number of days a product can be owned
+        # Ownership Max Duration - Maximum number of seconds a product can be owned
         # Only applies when HasTimeLimit = $true
-        # Common values: 90 (3 months), 365 (1 year), 3650 (10 years)
-        OwnershipMaxDuration       = 365
+        # Common values: 7776000 (90 days), 31536000 (365 days), 315360000 (10 years)
+        OwnershipMaxDuration       = 31536000
     
         # ===== AGENT POOL =====
         # Which HelloID agent pool executes the product actions
@@ -455,11 +456,13 @@ $calculatedResourceOwnerGroupSuffix = " Resource Owner"  # At least prefix OR su
 ######################################################################################
 
 ######################################################################################
-# Update Behavior - When to update existing products (normally keep all $false)
+# Update Behavior - When to update existing products
 ######################################################################################
-# WARNING: Only set $true when you've changed product settings and want to update ALL existing products
-#          This will overwrite configured properties on every product that matches the filter
-#          After updating, set back to $false to prevent unwanted updates on subsequent runs
+# IMPORTANT: Only enable when you need to keep product properties synchronized with the source system
+# - Setting this to $true has PERFORMANCE IMPACT - every sync run will compare and update properties
+# - Properties listed in $productPropertiesToUpdate cannot be manually changed (they get overwritten)
+# - Best practice: Only enable if you need continuous synchronization of specific properties (e.g., names)
+# - Alternative: Keep $false and update products manually when needed
 $overwriteExistingProduct = $true
 
 # Which product properties to update (if empty, no properties are updated - only actions if enabled below)
@@ -480,12 +483,10 @@ $productPropertiesToUpdate = @(
 
 # Update Resource Owner Group when product name changes
 # Only applies when $resourceOwnerMode = "Calculated"
-# WARNING: This setting renames HelloID groups when source object names change
-# - If $true: When the source object name changes, the associated resource owner group will be renamed
-#   Example: Source object renamed from "Sales" to "Sales Team" 
-#   -> Group "Sales Resource Owner" will be renamed to "Sales Team Resource Owner"
-# - If $false: Resource owner group names remain unchanged even when source object names change (safer default)
-# Recommendation: Only set to $true if you actively manage source object names and want groups to stay in sync
+# - If $true: Resource owner groups are renamed when source object names change
+#   Example: "Sales Resource Owner" becomes "Sales Team Resource Owner" when source object is renamed
+# - If $false: Resource owner group names remain unchanged even when source object names change
+# Recommendation: Set to $true for continuous name synchronization, $false if names should be managed manually
 $updateResourceOwnerGroupOnNameChange = $true
 
 # Access Group Update Behavior - Controls whether/how to update access groups on existing products
@@ -2095,6 +2096,606 @@ try {
             Write-StatusMessage -Event Information -Message "Test run: All operations are within limits ($originalCreateCount creates, $originalUpdateCount updates, $originalDeleteCount deletes)"
         }
     }
+    
+    # Determine which existing products actually need updates (only when update settings are enabled)
+    $actionMessage = "analyzing which existing products need updates"
+    $productsNeedingUpdate = [System.Collections.ArrayList]@()
+    
+    # Statistics for detailed logging (track reasons for updates)
+    $updateStatistics = @{
+        PropertyUpdates           = 0
+        OverwriteActions          = 0  # Count products that will have actions overwritten
+        AddMissingActions         = 0  # Count products that will have missing actions added
+        RemoveUnconfiguredActions = 0  # Count products that will have unconfigured actions removed
+        AccessGroupUpdates        = 0
+        ResourceOwnerGroupRenames = 0  # Track how many products will have resource owner group renamed
+        ResourceOwnerGroupDeletes = 0  # Track how many resource owner groups will be deleted with products
+        ChangedProperties         = @{}  # Dictionary to count which properties change
+    }
+    
+    # Store detailed info for verbose logging (shown after summary)
+    $productsWithPropertyChanges = @()
+    $productsWithActionUpdates = @()
+    $productsWithAccessGroupUpdates = @()
+    $productsWithResourceOwnerGroupRenames = @()
+    $productsWithResourceOwnerGroupDeletes = @()
+    
+    # Cache for full product details (to avoid duplicate API calls in processing section)
+    $fullProductDetailsCache = @{}
+    
+    # Store complete update information per product (ready for processing section to execute)
+    $productUpdateInstructions = @{}
+    
+    if ($overwriteExistingProduct -eq $true -or $overwriteExistingProductAction -eq $true -or $addMissingProductAction -eq $true -or $removeUnconfiguredActions -eq $true -or $accessGroupUpdateBehavior -ne "None") {
+        foreach ($existingProduct in $existingProducts) {
+            try {
+                # Get basic product info from grouped list (has name, description, etc - most properties)
+                $basicProductInfo = $helloIDSelfServiceProductsInScopeGrouped[$existingProduct.Code]
+                
+                # If it's a collection, take the first item
+                if ($basicProductInfo -is [System.Collections.IEnumerable] -and $basicProductInfo -isnot [string]) {
+                    $basicProductInfo = $basicProductInfo | Select-Object -First 1
+                }
+                
+                if ($null -eq $basicProductInfo) {
+                    # Product doesn't exist in HelloID - skip (shouldn't happen, but safety check)
+                    continue
+                }
+                
+                # Track update reasons for this product
+                $needsUpdate = $false
+                $updateReasons = @()
+                
+                # Check 1: Property updates enabled and properties differ (use basic product info - has all properties except actions)
+                if ($overwriteExistingProduct -eq $true) {
+                    if (($productPropertiesToUpdate | Measure-Object).Count -gt 0) {                        
+                        # Compare configured properties between desired state and current state (using basic product info)
+                        $splatCompareProperties = @{
+                            ReferenceObject  = @($basicProductInfo.PSObject.Properties | Where-Object { $_.Name -in $productPropertiesToUpdate })
+                            DifferenceObject = @($existingProduct.PSObject.Properties | Where-Object { $_.Name -in $productPropertiesToUpdate })
+                        }
+                        $changedProperties = (Compare-Object @splatCompareProperties -PassThru)
+                        $newProperties = $changedProperties.Where( { $_.SideIndicator -eq "=>" })
+                        
+                        if (($newProperties | Measure-Object).Count -gt 0) {
+                            $needsUpdate = $true
+                            $updateReasons += "Properties"
+                            $updateStatistics.PropertyUpdates++
+                            
+                            # Store details for verbose logging later (including old and new values)
+                            $changedPropsWithValues = @()
+                            foreach ($prop in $newProperties) {
+                                # Get old value (current in HelloID) and new value (desired state)
+                                $oldValue = $basicProductInfo.PSObject.Properties[$prop.Name].Value
+                                $newValue = $existingProduct.PSObject.Properties[$prop.Name].Value
+
+                                $changedPropsWithValues += [PSCustomObject]@{
+                                    PropertyName = $prop.Name
+                                    OldValue     = $oldValue
+                                    NewValue     = $newValue
+                                }
+                            }
+                            
+                            $productsWithPropertyChanges += [PSCustomObject]@{
+                                Product           = $existingProduct
+                                ChangedProperties = $changedPropsWithValues
+                            }
+                            
+                            # Track which properties are changing (for statistics)
+                            foreach ($prop in $newProperties) {
+                                if ($updateStatistics.ChangedProperties.ContainsKey($prop.Name)) {
+                                    $updateStatistics.ChangedProperties[$prop.Name]++
+                                }
+                                else {
+                                    $updateStatistics.ChangedProperties[$prop.Name] = 1
+                                }
+                            }
+                        }
+                    }
+                    else {
+                        # All properties will be overwritten - assume update needed
+                        $needsUpdate = $true
+                        $updateReasons += "Properties"
+                        $updateStatistics.PropertyUpdates++
+                        
+                        # Store for verbose logging later
+                        $productsWithPropertyChanges += [PSCustomObject]@{
+                            Product           = $existingProduct
+                            ChangedProperties = @()  # Empty means all properties
+                        }
+                    }
+                }
+                
+                # Check 2: Action updates enabled - fetch full product details to compare actions
+                if ($overwriteExistingProductAction -eq $true -or $addMissingProductAction -eq $true -or $removeUnconfiguredActions -eq $true) {
+                    if (-not ($updateReasons -contains "Actions")) {
+                        
+                        # Fetch full product details to compare actions (actions not in basic product list)
+                        try {
+                            $actionMessage = "fetching full product details for [$($existingProduct.Name)] to compare actions"
+                            $getProductSplatParams = @{
+                                Uri     = "$($helloIDPortalBaseUrl)/api/v1/products/$($basicProductInfo.productId)"
+                                Method  = 'GET'
+                                Headers = $helloIDHeaders
+                            }
+                            $fullProductInfo = Invoke-HelloIDRestMethod @getProductSplatParams
+                            
+                            # Cache full product details for later use in processing section
+                            $fullProductDetailsCache[$existingProduct.Code] = $fullProductInfo
+                            
+                            # Determine what actions need to be added/removed/overwritten
+                            # Using same logic as processing section (around line 4150)
+                            $actionsToAdd = @()
+                            $actionsToRemove = @()
+                            $actionsToOverwrite = @()
+                            $hasActionChanges = $false
+                            
+                            # Process each action type that is configured for updates
+                            foreach ($actionType in $actionsToUpdate.Keys) {
+                                # Get current actions for this action type from HelloID
+                                $currentActionsForType = $fullProductInfo.$actionType
+                                
+                                # Get configured action names for this action type
+                                $configuredActionNames = $actionsToUpdate[$actionType]
+                                
+                                # Process each configured action name
+                                foreach ($actionName in $configuredActionNames) {
+                                    # Get the script content from the mapping
+                                    $newScriptContent = $actionScriptMapping[$actionName]
+                                    
+                                    if ([string]::IsNullOrEmpty($newScriptContent)) {
+                                        continue
+                                    }
+                                    
+                                    # Find matching action by name in current product
+                                    $matchingCurrentAction = $currentActionsForType | Where-Object { $_.name -eq $actionName } | Select-Object -First 1
+                                    
+                                    if ($null -ne $matchingCurrentAction) {
+                                        # Action exists - compare scripts (only if overwrite enabled)
+                                        if ($overwriteExistingProductAction -eq $true) {
+                                            if ($newScriptContent -ne $matchingCurrentAction.script) {
+                                                # Script differs - mark for overwrite
+                                                $actionsToOverwrite += [PSCustomObject]@{
+                                                    Type = $actionType
+                                                    Name = $actionName
+                                                }
+                                                $hasActionChanges = $true
+                                            }
+                                        }
+                                    }
+                                    else {
+                                        # Action doesn't exist - mark for add (if enabled)
+                                        if ($addMissingProductAction -eq $true) {
+                                            $actionsToAdd += [PSCustomObject]@{
+                                                Type = $actionType
+                                                Name = $actionName
+                                            }
+                                            $hasActionChanges = $true
+                                        }
+                                    }
+                                }
+                                
+                                # Check for actions to remove (current actions not in configuration)
+                                if ($removeUnconfiguredActions -eq $true) {
+                                    foreach ($currentAction in $currentActionsForType) {
+                                        $isConfigured = $configuredActionNames | Where-Object { $_ -eq $currentAction.name }
+                                        if ($null -eq $isConfigured) {
+                                            # Action not in configuration - mark for removal
+                                            $actionsToRemove += [PSCustomObject]@{
+                                                Type = $actionType
+                                                Name = $currentAction.name
+                                            }
+                                            $hasActionChanges = $true
+                                        }
+                                    }
+                                }
+                            }
+                        
+                            # Only add to update list if there are actual action changes
+                            if ($hasActionChanges) {
+                                $updateReasons += "Actions"
+                            
+                                # Store for verbose logging later
+                                $productsWithActionUpdates += [PSCustomObject]@{
+                                    Product                  = $existingProduct
+                                    OverwriteExistingAction  = $overwriteExistingProductAction
+                                    AddMissingAction         = $addMissingProductAction
+                                    RemoveUnconfiguredAction = $removeUnconfiguredActions
+                                    ActionsToAdd             = $actionsToAdd
+                                    ActionsToRemove          = $actionsToRemove
+                                    ActionsToOverwrite       = $actionsToOverwrite
+                                }
+                            
+                                # Count per action type (based on actual changes detected)
+                                if (($actionsToOverwrite | Measure-Object).Count -gt 0) {
+                                    $updateStatistics.OverwriteActions++
+                                }
+                                if (($actionsToAdd | Measure-Object).Count -gt 0) {
+                                    $updateStatistics.AddMissingActions++
+                                }
+                                if (($actionsToRemove | Measure-Object).Count -gt 0) {
+                                    $updateStatistics.RemoveUnconfiguredActions++
+                                }
+                            
+                                $needsUpdate = $true
+                            }
+                        }
+                        catch {
+                            # If we can't fetch product details for action comparison, skip this product
+                            if ($verboseLogging -eq $true) {
+                                Write-Verbose "Could not fetch full product details for action comparison for [$($existingProduct.Name)]: $($_.Exception.Message)"
+                            }
+                            # Don't count as update needed - we can't determine if actions differ
+                        }
+                    }
+                }
+                
+                # Check 3: Access group updates enabled - calculate which groups to add/remove
+                if ($accessGroupUpdateBehavior -ne "None") {
+                    # Initialize access group changes tracking
+                    $accessGroupChanges = @{
+                        ToAdd    = @()
+                        ToRemove = @()
+                    }
+                    
+                    # Get full product info (fetch if not already cached from action comparison)
+                    $fullProductInfo = $null
+                    if ($fullProductDetailsCache.ContainsKey($existingProduct.Code)) {
+                        $fullProductInfo = $fullProductDetailsCache[$existingProduct.Code]
+                    }
+                    else {
+                        # Need to fetch full product details to get current access groups
+                        try {
+                            $getProductSplatParams = @{
+                                Uri     = "$($helloIDPortalBaseUrl)/api/v1/products/$($basicProductInfo.productId)"
+                                Method  = 'GET'
+                                Headers = $helloIDHeaders
+                            }
+                            $fullProductInfo = Invoke-HelloIDRestMethod @getProductSplatParams
+                            
+                            # Cache for later use in processing section
+                            $fullProductDetailsCache[$existingProduct.Code] = $fullProductInfo
+                        }
+                        catch {
+                            # If we can't fetch product details, skip access group comparison
+                            if ($verboseLogging -eq $true) {
+                                Write-Verbose "Could not fetch full product details for access group comparison for [$($existingProduct.Name)]: $($_.Exception.Message)"
+                            }
+                        }
+                    }
+                    
+                    # Calculate access group changes if we have full product info
+                    if ($null -ne $fullProductInfo) {
+                        # For Replace mode: determine which groups to add/remove
+                        if ($accessGroupUpdateBehavior -eq "Replace") {
+                            # Get current group IDs from HelloID
+                            if ($null -ne $fullProductInfo.accessGroups) {
+                                $currentGroupIds = @($fullProductInfo.accessGroups | ForEach-Object { $_.id })
+                            }
+                            else {
+                                $currentGroupIds = @()
+                            }
+                            
+                            # Get desired group IDs from configuration
+                            if ($null -ne $existingProduct.accessGroups) {
+                                $desiredGroupIds = @($existingProduct.accessGroups | ForEach-Object { $_.id })
+                            }
+                            else {
+                                $desiredGroupIds = @()
+                            }
+                            
+                            # Groups to remove (in current but not in desired)
+                            if ($null -ne $fullProductInfo.accessGroups) {
+                                $accessGroupChanges.ToRemove = @($fullProductInfo.accessGroups | 
+                                    Where-Object { $_.id -notin $desiredGroupIds })
+                            }
+                            
+                            # Groups to add (in desired but not in current)
+                            if ($null -ne $existingProduct.accessGroups) {
+                                $accessGroupChanges.ToAdd = @($existingProduct.accessGroups | 
+                                    Where-Object { $_.id -notin $currentGroupIds })
+                            }
+                        }
+                        # For Add mode: add groups that don't exist yet
+                        elseif ($accessGroupUpdateBehavior -eq "Add") {
+                            # Get current group IDs from HelloID
+                            if ($null -ne $fullProductInfo.accessGroups) {
+                                $currentGroupIds = @($fullProductInfo.accessGroups | ForEach-Object { $_.id })
+                            }
+                            else {
+                                $currentGroupIds = @()
+                            }
+                            
+                            # Groups to add (in desired but not in current)
+                            if ($null -ne $existingProduct.accessGroups) {
+                                $accessGroupChanges.ToAdd = @($existingProduct.accessGroups | 
+                                    Where-Object { $_.id -notin $currentGroupIds })
+                            }
+                        }
+                        
+                        # Only mark as needing update if there are actual changes
+                        if (($accessGroupChanges.ToAdd | Measure-Object).Count -gt 0 -or 
+                            ($accessGroupChanges.ToRemove | Measure-Object).Count -gt 0) {
+                            
+                            $updateReasons += "AccessGroups"
+                            $updateStatistics.AccessGroupUpdates++
+                            
+                            # Store detailed info for verbose logging and processing
+                            $productsWithAccessGroupUpdates += [PSCustomObject]@{
+                                Product = $existingProduct
+                                Changes = $accessGroupChanges
+                            }
+                            
+                            $needsUpdate = $true
+                        }
+                    }
+                }
+                
+                # Build complete update body if any update is needed (ready for processing section)
+                if ($needsUpdate) {
+                    $updateBody = $null
+                    
+                    # Start with source product (use cached full product if available, otherwise basic info)
+                    if ($fullProductDetailsCache.ContainsKey($existingProduct.Code)) {
+                        $sourceProduct = $fullProductDetailsCache[$existingProduct.Code]
+                    }
+                    else {
+                        $sourceProduct = $basicProductInfo
+                    }
+                    
+                    # Clone the source product to avoid modifying the original
+                    $updateBody = $sourceProduct | ConvertTo-Json -Depth 10 | ConvertFrom-Json
+                    
+                    # Apply property changes if configured
+                    if ($updateReasons -contains "Properties") {
+                        $propInfo = $productsWithPropertyChanges | Where-Object { $_.Product.Code -eq $existingProduct.Code }
+                        if ($null -ne $propInfo) {
+                            foreach ($change in $propInfo.ChangedProperties) {
+                                $updateBody | Add-Member -MemberType NoteProperty -Name $change.PropertyName -Value $change.NewValue -Force
+                            }
+                        }
+                    }
+                    
+                    # Apply action changes if configured (complex logic - build complete action arrays)
+                    if ($updateReasons -contains "Actions") {
+                        # Get full product info for current actions
+                        $currentProductInHelloID = $fullProductDetailsCache[$existingProduct.Code]
+                        
+                        if ($null -ne $currentProductInHelloID) {
+                            # Process each action type that is configured for updates
+                            foreach ($actionType in $actionsToUpdate.Keys) {
+                                $processedActions = [System.Collections.Generic.list[object]]@()
+                                
+                                # Get current actions for this action type from HelloID
+                                $currentActions = $currentProductInHelloID.$actionType
+                                
+                                # Get configured action names for this action type
+                                $configuredActionNames = $actionsToUpdate[$actionType]
+                                
+                                # Process each configured action name
+                                foreach ($actionName in $configuredActionNames) {
+                                    # Get the script content from the mapping
+                                    $newScriptContent = $actionScriptMapping[$actionName]
+                                    
+                                    if ([string]::IsNullOrEmpty($newScriptContent)) {
+                                        continue
+                                    }
+                                    
+                                    # Find matching action by name in current product
+                                    $matchingCurrentAction = $currentActions | Where-Object { $_.name -eq $actionName } | Select-Object -First 1
+                                    
+                                    if ($null -ne $matchingCurrentAction) {
+                                        # Action exists
+                                        if ($overwriteExistingProductAction -eq $true) {
+                                            # Overwrite with new script (keep ID)
+                                            $updatedAction = [PSCustomObject]@{
+                                                id          = $matchingCurrentAction.id
+                                                name        = $actionName
+                                                script      = $newScriptContent
+                                                agentPoolId = $matchingCurrentAction.agentPoolId
+                                                runInCloud  = $matchingCurrentAction.runInCloud
+                                            }
+                                            [void]$processedActions.Add($updatedAction)
+                                        }
+                                        else {
+                                            # Keep as-is
+                                            $preservedAction = [PSCustomObject]@{
+                                                id          = $matchingCurrentAction.id
+                                                name        = $matchingCurrentAction.name
+                                                script      = $matchingCurrentAction.script
+                                                agentPoolId = $matchingCurrentAction.agentPoolId
+                                                runInCloud  = $matchingCurrentAction.runInCloud
+                                            }
+                                            [void]$processedActions.Add($preservedAction)
+                                        }
+                                    }
+                                    else {
+                                        # Action doesn't exist - add if enabled
+                                        if ($addMissingProductAction -eq $true) {
+                                            # Get agent pool and runInCloud from configured product
+                                            $configuredAction = $existingProduct.$actionType | Where-Object { $_.name -eq $actionName } | Select-Object -First 1
+                                            
+                                            if ($null -ne $configuredAction) {
+                                                $newAction = [PSCustomObject]@{
+                                                    id          = ""
+                                                    name        = $actionName
+                                                    script      = $newScriptContent
+                                                    agentPoolId = $configuredAction.agentPoolId
+                                                    runInCloud  = $configuredAction.runInCloud
+                                                }
+                                                [void]$processedActions.Add($newAction)
+                                            }
+                                        }
+                                    }
+                                }
+                                
+                                # Handle unconfigured actions (actions in HelloID but not in configuration)
+                                if ($removeUnconfiguredActions -eq $false) {
+                                    # Preserve unconfigured actions
+                                    foreach ($currentAction in $currentActions) {
+                                        $isConfigured = $configuredActionNames | Where-Object { $_ -eq $currentAction.name }
+                                        if ($null -eq $isConfigured) {
+                                            # Action not in configuration - keep as-is
+                                            $preservedAction = [PSCustomObject]@{
+                                                id          = $currentAction.id
+                                                name        = $currentAction.name
+                                                script      = $currentAction.script
+                                                agentPoolId = $currentAction.agentPoolId
+                                                runInCloud  = $currentAction.runInCloud
+                                            }
+                                            [void]$processedActions.Add($preservedAction)
+                                        }
+                                    }
+                                }
+                                # else: removeUnconfiguredActions is true - don't add them (they get removed)
+                                
+                                # Add the processed actions to the update body
+                                $updateBody | Add-Member -MemberType NoteProperty -Name $actionType -Value $processedActions -Force
+                            }
+                            
+                            # Preserve action types that are NOT in the configuration
+                            $actionProperties = @('onRequest', 'onApprove', 'onDeny', 'onReturn', 'onWithdraw')
+                            foreach ($actionProperty in $actionProperties) {
+                                if ($actionProperty -notin $actionsToUpdate.Keys) {
+                                    # Keep existing actions for this type as-is
+                                    if (($currentProductInHelloID.$actionProperty | Measure-Object).Count -gt 0) {
+                                        $updateBody | Add-Member -MemberType NoteProperty -Name $actionProperty -Value $currentProductInHelloID.$actionProperty -Force
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    
+                    # Store complete update instruction for processing section
+                    $productUpdateInstructions[$existingProduct.Code] = @{
+                        Product               = $existingProduct
+                        UpdateBody            = $updateBody
+                        UpdateReasons         = $updateReasons
+                        HasPropertyChanges    = ($updateReasons -contains "Properties")
+                        HasActionChanges      = ($updateReasons -contains "Actions")
+                        HasAccessGroupChanges = ($updateReasons -contains "AccessGroups")
+                        PropertyChanges       = if ($updateReasons -contains "Properties") {
+                            ($productsWithPropertyChanges | Where-Object { $_.Product.Code -eq $existingProduct.Code }).ChangedProperties
+                        }
+                        else { $null }
+                        ActionChanges         = if ($updateReasons -contains "Actions") {
+                            ($productsWithActionUpdates | Where-Object { $_.Product.Code -eq $existingProduct.Code })
+                        }
+                        else { $null }
+                        AccessGroupChanges    = if ($updateReasons -contains "AccessGroups") {
+                            ($productsWithAccessGroupUpdates | Where-Object { $_.Product.Code -eq $existingProduct.Code }).Changes
+                        }
+                        else { $null }
+                    }
+                    
+                    [void]$productsNeedingUpdate.Add($existingProduct)
+                }
+            }
+            catch {
+                # If we can't determine if update is needed, assume it is (safe approach)
+                [void]$productsNeedingUpdate.Add($existingProduct)
+            }
+        }
+    }
+    
+    # Check for resource owner group renames (independent of other updates)
+    # This runs for ALL existing products, not just those needing updates
+    if ($updateResourceOwnerGroupOnNameChange -eq $true -and $resourceOwnerMode -eq "Calculated" -and ($existingProducts | Measure-Object).Count -gt 0) {
+        foreach ($existingProduct in $existingProducts) {
+            try {
+                # Get current product info from HelloID
+                # Use cached full product details if available (has resource owner group info)
+                # Otherwise fetch from basic product list (which may not have full details)
+                $currentProductInHelloID = $null
+                if ($fullProductDetailsCache.ContainsKey($existingProduct.Code)) {
+                    $currentProductInHelloID = $fullProductDetailsCache[$existingProduct.Code]
+                }
+                else {
+                    # Not in cache - need to fetch full product details to check resource owner group
+                    $basicProductInfo = $helloIDSelfServiceProductsInScopeGrouped[$existingProduct.Code]
+                    if ($basicProductInfo -is [System.Collections.IEnumerable] -and $basicProductInfo -isnot [string]) {
+                        $basicProductInfo = $basicProductInfo | Select-Object -First 1
+                    }
+                    
+                    if ($null -ne $basicProductInfo) {
+                        try {
+                            $getProductSplatParams = @{
+                                Uri     = "$($helloIDPortalBaseUrl)/api/v1/products/$($basicProductInfo.productId)"
+                                Method  = 'GET'
+                                Headers = $helloIDHeaders
+                            }
+                            $currentProductInHelloID = Invoke-HelloIDRestMethod @getProductSplatParams
+                            
+                            # Cache for later use
+                            $fullProductDetailsCache[$existingProduct.Code] = $currentProductInHelloID
+                        }
+                        catch {
+                            # Skip this product if we can't fetch details
+                            continue
+                        }
+                    }
+                }
+                
+                if ($null -ne $currentProductInHelloID -and $null -ne $currentProductInHelloID.resourceOwnerGroup -and -not[string]::IsNullOrEmpty($currentProductInHelloID.resourceOwnerGroup.name)) {
+                    # Only check Local groups
+                    if ($currentProductInHelloID.resourceOwnerGroup.name -like "Local/*") {
+                        # Find corresponding source object
+                        $correspondingSourceObject = $sourceObjectsInScopeGrouped[$currentProductInHelloID.code]
+                        
+                        if ($null -ne $correspondingSourceObject) {
+                            # Calculate expected resource owner group name
+                            $expectedResourceOwnerGroupName = Get-ResourceOwnerGroupName -SourceObjectDisplayName $correspondingSourceObject.DisplayName -IncludeSourcePrefix $true
+                            
+                            # Check if rename is needed
+                            if ($currentProductInHelloID.resourceOwnerGroup.name -ne $expectedResourceOwnerGroupName) {
+                                $updateStatistics.ResourceOwnerGroupRenames++
+                                $productsWithResourceOwnerGroupRenames += [PSCustomObject]@{
+                                    Product = $existingProduct
+                                    OldName = $currentProductInHelloID.resourceOwnerGroup.name
+                                    NewName = $expectedResourceOwnerGroupName
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            catch {
+                # Silently skip errors during rename detection
+            }
+        }
+    }
+    
+    # Check for resource owner group deletes (only when products will be removed)
+    if ($removeProductBehavior -eq "Remove" -and $removeResourceOwnerGroupWithProduct -eq $true -and ($obsoleteProducts | Measure-Object).Count -gt 0) {
+        foreach ($obsoleteProduct in $obsoleteProducts) {
+            try {
+                # Check if product has a resource owner group
+                if ($null -ne $obsoleteProduct.resourceOwnerGroup -and -not[string]::IsNullOrEmpty($obsoleteProduct.resourceOwnerGroup.name)) {
+                    # Only count Local groups (not synced groups like from AzureAD)
+                    if ($obsoleteProduct.resourceOwnerGroup.name -like "Local/*") {
+                        $updateStatistics.ResourceOwnerGroupDeletes++
+                        $productsWithResourceOwnerGroupDeletes += [PSCustomObject]@{
+                            Product   = $obsoleteProduct
+                            GroupName = $obsoleteProduct.resourceOwnerGroup.name
+                        }
+                    }
+                }
+            }
+            catch {
+                # Silently skip errors during delete detection
+            }
+        }
+    }
+    
+    # Check if update threshold is exceeded based on products that actually need updates
+    $updateThresholdExceeded = $false
+    if (($overwriteExistingProduct -eq $true -or $overwriteExistingProductAction -eq $true -or $addMissingProductAction -eq $true -or $removeUnconfiguredActions -eq $true -or $accessGroupUpdateBehavior -ne "None") -and 
+        $null -ne $updateThreshold -and ($productsNeedingUpdate | Measure-Object).Count -ge $updateThreshold) {
+        $updateThresholdExceeded = $true
+        if ($verboseLogging -eq $true) {
+            Write-Verbose "Update threshold exceeded: Would update [$(($productsNeedingUpdate | Measure-Object).Count)] products (with actual changes), but threshold is set to [$updateThreshold]"
+        }
+    }
 }
 catch {
     $ex = $PSItem
@@ -2118,54 +2719,211 @@ Write-StatusMessage -Event Information -Message "------[Summary]------"
 Write-StatusMessage -Event Information -Message "Total source objects in scope [$(($sourceObjectsInScope | Measure-Object).Count)]"
 
 if ($overwriteExistingProduct -eq $true -or $overwriteExistingProductAction -eq $true -or $addMissingProductAction -eq $true -or $removeUnconfiguredActions -eq $true -or $accessGroupUpdateBehavior -ne "None") {
-    Write-StatusMessage -Event Information "Total HelloID Self service Product(s) already exist (and will be updated) [$(($existingProducts | Measure-Object).Count)]"
+    Write-StatusMessage -Event Information "Total HelloID Self service Product(s) already exist: [$(($existingProducts | Measure-Object).Count)] (of which [$(($productsNeedingUpdate | Measure-Object).Count)] need(s) update)"
     
-    # Show what will be updated
+    # Show detailed breakdown of why products need updates
+    if (($productsNeedingUpdate | Measure-Object).Count -gt 0) {
+        Write-StatusMessage -Event Information "  Update reasons breakdown:"
+        
+        # Property changes
+        if ($updateStatistics.PropertyUpdates -gt 0) {
+            Write-StatusMessage -Event Information "    - [$($updateStatistics.PropertyUpdates)] product(s) with property changes detected"
+            
+            # Show which properties are changing (if specific properties configured)
+            if (($productPropertiesToUpdate | Measure-Object).Count -gt 0 -and $updateStatistics.ChangedProperties.Count -gt 0) {
+                $propertyChangeSummary = ($updateStatistics.ChangedProperties.GetEnumerator() | Sort-Object -Property Value -Descending | ForEach-Object { "$($_.Key): $($_.Value)" }) -join ', '
+                Write-StatusMessage -Event Information "      Properties: $propertyChangeSummary"
+            }
+            
+            # Show details if verbose logging enabled
+            if ($verboseLogging -eq $true -and ($productsWithPropertyChanges | Measure-Object).Count -gt 0) {
+                foreach ($productInfo in $productsWithPropertyChanges) {
+                    $product = $productInfo.Product
+                    $changedProps = $productInfo.ChangedProperties
+                    
+                    Write-StatusMessage -Event Information "      Product: [$($product.Name)] (Code: [$($product.Code)])"
+                    
+                    if (($changedProps | Measure-Object).Count -eq 0) {
+                        Write-StatusMessage -Event Information "        All properties will be overwritten (no specific properties configured)"
+                    }
+                    else {
+                        foreach ($propInfo in $changedProps) {
+                            # Format values for readability
+                            $oldValueDisplay = if ($null -eq $propInfo.OldValue) { "<null>" } 
+                            elseif ([string]::IsNullOrWhiteSpace($propInfo.OldValue)) { "<empty>" }
+                            elseif ($propInfo.OldValue.ToString().Length -gt 100) { "$($propInfo.OldValue.ToString().Substring(0, 97))..." }
+                            else { $propInfo.OldValue }
+                            
+                            $newValueDisplay = if ($null -eq $propInfo.NewValue) { "<null>" }
+                            elseif ([string]::IsNullOrWhiteSpace($propInfo.NewValue)) { "<empty>" }
+                            elseif ($propInfo.NewValue.ToString().Length -gt 100) { "$($propInfo.NewValue.ToString().Substring(0, 97))..." }
+                            else { $propInfo.NewValue }
+                            
+                            Write-StatusMessage -Event Information "        [$($propInfo.PropertyName)]: [$oldValueDisplay] -> [$newValueDisplay]"
+                        }
+                    }
+                }
+            }
+        }
+        
+        # Action updates - separate line per type
+        if ($updateStatistics.OverwriteActions -gt 0) {
+            Write-StatusMessage -Event Information "    - [$($updateStatistics.OverwriteActions)] product(s) will have existing actions overwritten"
+            
+            # Show details if verbose logging enabled
+            if ($verboseLogging -eq $true -and ($productsWithActionUpdates | Measure-Object).Count -gt 0) {
+                foreach ($productInfo in $productsWithActionUpdates | Where-Object { ($_.ActionsToOverwrite | Measure-Object).Count -gt 0 }) {
+                    $product = $productInfo.Product
+                    Write-StatusMessage -Event Information "      Product: [$($product.Name)] (Code: [$($product.Code)])"
+                    
+                    # Show actions that will be overwritten (same name, script will be updated)
+                    Write-StatusMessage -Event Information "        Actions to overwrite:"
+                    $groupedOverwrite = $productInfo.ActionsToOverwrite | Group-Object -Property Type
+                    foreach ($group in $groupedOverwrite) {
+                        $actionNames = ($group.Group | ForEach-Object { $_.Name }) -join ', '
+                        Write-StatusMessage -Event Information "          [$($group.Name)]: $actionNames"
+                    }
+                }
+            }
+        }
+        
+        if ($updateStatistics.AddMissingActions -gt 0) {
+            Write-StatusMessage -Event Information "    - [$($updateStatistics.AddMissingActions)] product(s) will have missing actions added"
+            
+            # Show details if verbose logging enabled
+            if ($verboseLogging -eq $true -and ($productsWithActionUpdates | Measure-Object).Count -gt 0) {
+                foreach ($productInfo in $productsWithActionUpdates | Where-Object { ($_.ActionsToAdd | Measure-Object).Count -gt 0 }) {
+                    $product = $productInfo.Product
+                    Write-StatusMessage -Event Information "      Product: [$($product.Name)] (Code: [$($product.Code)])"
+                    
+                    # Show only the actions that will actually be added
+                    Write-StatusMessage -Event Information "        Actions to add:"
+                    $groupedToAdd = $productInfo.ActionsToAdd | Group-Object -Property Type
+                    foreach ($group in $groupedToAdd) {
+                        $actionNames = ($group.Group | ForEach-Object { $_.Name }) -join ', '
+                        Write-StatusMessage -Event Information "          [$($group.Name)]: $actionNames"
+                    }
+                }
+            }
+        }
+        
+        if ($updateStatistics.RemoveUnconfiguredActions -gt 0) {
+            Write-StatusMessage -Event Information "    - [$($updateStatistics.RemoveUnconfiguredActions)] product(s) will have unconfigured actions removed"
+            
+            # Show details if verbose logging enabled
+            if ($verboseLogging -eq $true -and ($productsWithActionUpdates | Measure-Object).Count -gt 0) {
+                foreach ($productInfo in $productsWithActionUpdates | Where-Object { ($_.ActionsToRemove | Measure-Object).Count -gt 0 }) {
+                    $product = $productInfo.Product
+                    Write-StatusMessage -Event Information "      Product: [$($product.Name)] (Code: [$($product.Code)])"
+                    
+                    # Show only the actions that will actually be removed
+                    Write-StatusMessage -Event Information "        Actions to remove:"
+                    $groupedToRemove = $productInfo.ActionsToRemove | Group-Object -Property Type
+                    foreach ($group in $groupedToRemove) {
+                        $actionNames = ($group.Group | ForEach-Object { $_.Name }) -join ', '
+                        Write-StatusMessage -Event Information "          [$($group.Name)]: $actionNames"
+                    }
+                }
+            }
+        }
+        
+        # Access group updates
+        if ($updateStatistics.AccessGroupUpdates -gt 0) {
+            $mode = if ($accessGroupUpdateBehavior -eq "Replace") { "Replace" } else { "Add" }
+            Write-StatusMessage -Event Information "    - [$($updateStatistics.AccessGroupUpdates)] product(s) will have access groups updated (mode: $mode)"
+            
+            # Show details if verbose logging enabled
+            if ($verboseLogging -eq $true -and ($productsWithAccessGroupUpdates | Measure-Object).Count -gt 0) {
+                foreach ($productInfo in $productsWithAccessGroupUpdates) {
+                    Write-StatusMessage -Event Information "      Product: [$($productInfo.Product.Name)] (Code: [$($productInfo.Product.Code)])"
+                    
+                    # Show groups to add
+                    if (($productInfo.Changes.ToAdd | Measure-Object).Count -gt 0) {
+                        Write-StatusMessage -Event Information "        Groups to add:"
+                        foreach ($group in $productInfo.Changes.ToAdd) {
+                            Write-StatusMessage -Event Information "          - $($group.name)"
+                        }
+                    }
+                    
+                    # Show groups to remove (only for Replace mode)
+                    if (($productInfo.Changes.ToRemove | Measure-Object).Count -gt 0) {
+                        Write-StatusMessage -Event Information "        Groups to remove:"
+                        foreach ($group in $productInfo.Changes.ToRemove) {
+                            Write-StatusMessage -Event Information "          - $($group.name)"
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    # Show configuration details
+    Write-StatusMessage -Event Information "  Update configuration:"
     if ($overwriteExistingProduct -eq $true -and ($productPropertiesToUpdate | Measure-Object).Count -gt 0) {
         $propertiesToUpdateString = ($productPropertiesToUpdate | ForEach-Object { $_ }) -join ', '
-        Write-StatusMessage -Event Information "  - Overwrite Product Properties: Enabled. Properties to update: [$propertiesToUpdateString]"
+        Write-StatusMessage -Event Information "    - Overwrite Properties: $propertiesToUpdateString"
     }
     elseif ($overwriteExistingProduct -eq $true) {
-        Write-StatusMessage -Event Information "  - Overwrite Product Properties: Enabled. All non-action properties will be updated"
+        Write-StatusMessage -Event Information "    - Overwrite Properties: All non-action properties"
     }
     
     if ($overwriteExistingProductAction -eq $true -or $addMissingProductAction -eq $true -or $removeUnconfiguredActions -eq $true) {
         $actionUpdateMessage = @()
-        if ($overwriteExistingProductAction -eq $true) {
-            $actionUpdateMessage += "Overwrite existing actions"
-        }
-        if ($addMissingProductAction -eq $true) {
-            $actionUpdateMessage += "Add missing actions"
-        }
-        if ($removeUnconfiguredActions -eq $true) {
-            $actionUpdateMessage += "Remove unconfigured actions"
-        }
+        if ($overwriteExistingProductAction -eq $true) { $actionUpdateMessage += "Overwrite" }
+        if ($addMissingProductAction -eq $true) { $actionUpdateMessage += "Add missing" }
+        if ($removeUnconfiguredActions -eq $true) { $actionUpdateMessage += "Remove unconfigured" }
         $actionUpdateString = $actionUpdateMessage -join ', '
-        Write-StatusMessage -Event Information "  - Product Action Updates: Enabled ($actionUpdateString)"
-        
-        foreach ($actionType in $actionsToUpdate.Keys) {
-            $actionNames = $actionsToUpdate[$actionType] -join ', '
-            Write-StatusMessage -Event Information "    - [$actionType]: $actionNames"
-        }
+        Write-StatusMessage -Event Information "    - Actions: $actionUpdateString"
     }
     
     if ($accessGroupUpdateBehavior -ne "None") {
-        Write-StatusMessage -Event Information "  - Access Group Updates: Enabled (Behavior: $accessGroupUpdateBehavior)"
+        Write-StatusMessage -Event Information "    - Access Groups: $accessGroupUpdateBehavior"
     }
 }
 else {
     Write-StatusMessage -Event Information -Message "Total HelloID Self service Product(s) already exist (and won't be changed) [$(($existingProducts | Measure-Object).Count)]"
 }
 
-# Show resource owner group rename setting (independent of product updates)
+# Show resource owner group rename information (independent of product updates)
 if ($updateResourceOwnerGroupOnNameChange -eq $true -and $resourceOwnerMode -eq "Calculated") {
-    Write-StatusMessage -Event Information "Resource Owner Group Rename: Enabled. Groups will be renamed when source object names change"
+    if ($updateStatistics.ResourceOwnerGroupRenames -gt 0) {
+        Write-StatusMessage -Event Information "Resource Owner Group Renames: [$($updateStatistics.ResourceOwnerGroupRenames)] group(s) will be renamed (name change detected)"
+        
+        # Show details if verbose logging enabled
+        if ($verboseLogging -eq $true -and ($productsWithResourceOwnerGroupRenames | Measure-Object).Count -gt 0) {
+            foreach ($productInfo in $productsWithResourceOwnerGroupRenames) {
+                Write-StatusMessage -Event Information "  Product: [$($productInfo.Product.Name)] (Code: [$($productInfo.Product.Code)])"
+                Write-StatusMessage -Event Information "    [$($productInfo.OldName)] -> [$($productInfo.NewName)]"
+            }
+        }
+    }
+    else {
+        Write-StatusMessage -Event Information "Resource Owner Group Rename: Enabled, but no name changes detected"
+    }
+}
+
+# Show resource owner group rename setting (independent of product updates)
+if ($updateResourceOwnerGroupOnNameChange -eq $false -and $resourceOwnerMode -eq "Calculated") {
+    Write-StatusMessage -Event Information "Resource Owner Group Rename: Disabled (groups will not be renamed when source object names change)"
 }
 
 Write-StatusMessage -Event Information -Message "Total HelloID Self service Product(s) to create [$(($newProducts | Measure-Object).Count)]"
 
+# Show additional statistics about product removes and related actions
 if ($removeProductBehavior -eq "Remove") {
     Write-StatusMessage -Event Information "Total HelloID Self service Product(s) to remove [$(($obsoleteProducts | Measure-Object).Count)]"
+    
+    if ($removeResourceOwnerGroupWithProduct -eq $true -and $updateStatistics.ResourceOwnerGroupDeletes -gt 0) {
+        Write-StatusMessage -Event Information "  - [$($updateStatistics.ResourceOwnerGroupDeletes)] resource owner group(s) will be deleted with products"
+        
+        # Show details if verbose logging enabled
+        if ($verboseLogging -eq $true -and ($productsWithResourceOwnerGroupDeletes | Measure-Object).Count -gt 0) {
+            foreach ($productInfo in $productsWithResourceOwnerGroupDeletes) {
+                Write-StatusMessage -Event Information "    Product: [$($productInfo.Product.Name)] (Code: [$($productInfo.Product.code)])"
+                Write-StatusMessage -Event Information "      Resource owner group: [$($productInfo.GroupName)]"
+            }
+        }
+    }
 }
 elseif ($removeProductBehavior -eq "Disable") {
     Write-StatusMessage -Event Information "Total HelloID Self service Product(s) to disable [$(($obsoleteProducts | Measure-Object).Count)]"
@@ -2531,7 +3289,7 @@ try {
             else {
                 if ($obsoleteProductThresholdExceeded -eq $false) {
                     Write-StatusMessage -Event Warning -Message "DryRun: Would remove [$(($obsoleteProducts | Measure-Object).Count)] HelloID Self service Products"
-                    Write-StatusMessage -Event Warning -Message "DryRun: Would remove [$(($obsoleteProducts | Measure-Object).Count)] HelloID Self service Products"
+                    Write-SummaryMessage -Event Warning -Message "DryRun: Would remove [$(($obsoleteProducts | Measure-Object).Count)] HelloID Self service Products"
                 }
             }
         }
@@ -2565,33 +3323,31 @@ try {
     $productUpdatesSkipped = 0
     $productPropertiesUpdatedCount = 0
     $productActionsUpdatedCount = 0
+    $productAccessGroupsUpdatedCount = 0
     
-    # Check if update threshold is exceeded (only when update settings are enabled)
-    $updateThresholdExceeded = $false
-    if (($overwriteExistingProduct -eq $true -or $overwriteExistingProductAction -eq $true -or $addMissingProductAction -eq $true -or $removeUnconfiguredActions -eq $true -or $accessGroupUpdateBehavior -ne "None") -and 
-        $null -ne $updateThreshold -and ($existingProducts | Measure-Object).Count -ge $updateThreshold) {
-        $updateThresholdExceeded = $true
-        if ($verboseLogging -eq $true) {
-            Write-Verbose "Update threshold exceeded: Would update [$(($existingProducts | Measure-Object).Count)] products, but threshold is set to [$updateThreshold]"
-        }
-    }
-    
-    # Only process products if threshold is not exceeded, or if verbose logging is enabled (for logging skipped products)
+    # Process products that need updates (already calculated in calculations section)
+    # Only process if threshold is not exceeded, or if verbose logging is enabled (for logging skipped products)
     $actionMessage = "processing existing HelloID Self service Products for update"
     if ($updateThresholdExceeded -eq $false -or $verboseLogging -eq $true) {
-        foreach ($existingProduct in $existingProducts) {
+        foreach ($existingProduct in $productsNeedingUpdate) {
             $actionMessage = "processing product [$($existingProduct.name)] for update"
             # Skip update if threshold is exceeded (only reached when verbose logging is enabled)
             if ($updateThresholdExceeded -eq $true) {
                 if ($verboseLogging -eq $true) {
                     Write-Verbose "Skipping update of product [$($existingProduct.Name)] - update threshold exceeded"
                 }
+                $productUpdatesSkipped++
                 continue
             }
             try {
                 # Get basic product info from grouped list
                 $basicProductInfo = $null
                 $basicProductInfo = $helloIDSelfServiceProductsInScopeGrouped[$existingProduct.Code]
+                
+                # If it's a collection, take the first item
+                if ($basicProductInfo -is [System.Collections.IEnumerable] -and $basicProductInfo -isnot [string]) {
+                    $basicProductInfo = $basicProductInfo | Select-Object -First 1
+                }
             
                 # Fetch full product details if needed (for actions or resource owner group rename)
                 $currentProductInHelloID = $null
@@ -2601,43 +3357,54 @@ try {
                         $removeUnconfiguredActions -eq $true -or 
                         ($updateResourceOwnerGroupOnNameChange -eq $true -and $resourceOwnerMode -eq "Calculated")
                     )) {
-                    $actionMessage = "retrieving full product details for product [$($existingProduct.name)]"
-                    try {
-                        $getProductSplatParams = @{
-                            Uri     = "$($helloIDPortalBaseUrl)/api/v1/products/$($basicProductInfo.productId)"
-                            Method  = 'GET'
-                            Headers = $helloIDHeaders
-                        }
-                        $currentProductInHelloID = Invoke-HelloIDRestMethod @getProductSplatParams
                     
+                    # Check if we already have full product details in cache (from calculations section)
+                    if ($fullProductDetailsCache.ContainsKey($existingProduct.Code)) {
+                        $currentProductInHelloID = $fullProductDetailsCache[$existingProduct.Code]
+                        
                         if ($verboseLogging -eq $true) {
-                            Write-Verbose "Successfully retrieved full product details for [$($currentProductInHelloID.name)]"
+                            Write-Verbose "Using cached full product details for [$($currentProductInHelloID.name)]"
                         }
                     }
-                    catch {
-                        $productUpdatesError++
+                    else {
+                        # Not in cache - fetch from API
+                        $actionMessage = "retrieving full product details for product [$($existingProduct.name)]"
+                        try {
+                            $getProductSplatParams = @{
+                                Uri     = "$($helloIDPortalBaseUrl)/api/v1/products/$($basicProductInfo.productId)"
+                                Method  = 'GET'
+                                Headers = $helloIDHeaders
+                            }
+                            $currentProductInHelloID = Invoke-HelloIDRestMethod @getProductSplatParams
                         
-                        if ($verboseLogging -eq $true) {
-                            $ex = $PSItem
-                            if ($($ex.Exception.GetType().FullName -eq "Microsoft.PowerShell.Commands.HttpResponseException") -or
-                                $($ex.Exception.GetType().FullName -eq "System.Net.WebException")) {
-                                $errorObj = Resolve-HelloIDError -ErrorObject $ex
-                                $warningMessage = "Error at Line '$($errorObj.ScriptLineNumber)': $($errorObj.Line). Error: $($errorObj.ErrorDetails)"
-                                $errorMessage = "Error $($actionMessage). Error: $($errorObj.FriendlyMessage)"
+                            if ($verboseLogging -eq $true) {
+                                Write-Verbose "Successfully retrieved full product details for [$($currentProductInHelloID.name)]"
                             }
-                            else {
-                                $warningMessage = "Error at Line '$($ex.InvocationInfo.ScriptLineNumber)': $($ex.InvocationInfo.Line). Error: $($ex.Exception.Message)"
-                                $errorMessage = "Error $($actionMessage). Error: $($ex.Exception.Message)"
-                            }
-                            Write-Verbose $warningMessage
-                            Write-Verbose $errorMessage
                         }
-                        
-                        # Skip this product and continue with next
-                        continue
+                        catch {
+                            $productUpdatesError++
+                            
+                            if ($verboseLogging -eq $true) {
+                                $ex = $PSItem
+                                if ($($ex.Exception.GetType().FullName -eq "Microsoft.PowerShell.Commands.HttpResponseException") -or
+                                    $($ex.Exception.GetType().FullName -eq "System.Net.WebException")) {
+                                    $errorObj = Resolve-HelloIDError -ErrorObject $ex
+                                    $warningMessage = "Error at Line '$($errorObj.ScriptLineNumber)': $($errorObj.Line). Error: $($errorObj.ErrorDetails)"
+                                    $errorMessage = "Error $($actionMessage). Error: $($errorObj.FriendlyMessage)"
+                                }
+                                else {
+                                    $warningMessage = "Error at Line '$($ex.InvocationInfo.ScriptLineNumber)': $($ex.InvocationInfo.Line). Error: $($ex.Exception.Message)"
+                                    $errorMessage = "Error $($actionMessage). Error: $($ex.Exception.Message)"
+                                }
+                                Write-Verbose $warningMessage
+                                Write-Verbose $errorMessage
+                            }
+                            
+                            # Skip this product and continue with next
+                            continue
+                        }
                     }
                 }
-            
                 # Update Resource Owner Group name if product name has changed (independent of other updates)
                 # Only applies when $resourceOwnerMode = "Calculated"
                 if ($updateResourceOwnerGroupOnNameChange -eq $true -and $resourceOwnerMode -eq "Calculated" -and $null -ne $currentProductInHelloID) {
@@ -2730,522 +3497,183 @@ try {
                     }
                 }
 
-                # Determine if we need to update this product
-                if ($null -ne $basicProductInfo -and ($overwriteExistingProduct -eq $true -or $overwriteExistingProductAction -eq $true -or $addMissingProductAction -eq $true -or $removeUnconfiguredActions -eq $true -or $accessGroupUpdateBehavior -ne "None")) {
-
-                    $actionMessage = "calculating changes for product [$($existingProduct.name)]"
-                    # Use detailed product info if available (when updating actions), otherwise use basic info
-                    $sourceProduct = if ($null -ne $currentProductInHelloID) { $currentProductInHelloID } else { $basicProductInfo }
+                # Get pre-calculated update instruction from calculations section
+                $updateInstruction = $productUpdateInstructions[$existingProduct.Code]
+                
+                if ($null -eq $updateInstruction) {
+                    # No update instruction found - skip this product
+                    $productUpdatesSkipped++
                     
-                    # Create deep copy of current product via JSON serialization
-                    $updateHelloIDSelfServiceProductBody = $sourceProduct | ConvertTo-Json -Depth 10 | ConvertFrom-Json
-
-                    # Calculate changes between current data and provided data
-                    # Only compare properties specified in configuration when $overwriteExistingProduct is true
-                    if ($overwriteExistingProduct -eq $true) {
-                        $splatCompareProperties = @{
-                            ReferenceObject  = @($sourceProduct.PSObject.Properties | Where-Object { $_.Name -in $productPropertiesToUpdate })
-                            DifferenceObject = @($existingProduct.PSObject.Properties | Where-Object { $_.Name -in $productPropertiesToUpdate })
+                    if ($verboseLogging -eq $true) {
+                        Write-Verbose "No update instruction found for product [$($existingProduct.Name)] - skipping"
+                    }
+                    continue
+                }
+                
+                # Execute updates based on pre-calculated instruction
+                $actionMessage = "executing updates for product [$($existingProduct.name)]"
+                
+                # Execute product update if property or action changes
+                if ($updateInstruction.HasPropertyChanges -or $updateInstruction.HasActionChanges) {
+                    $actionMessage = "updating HelloID Self service Product [$($existingProduct.name)]"
+                    $updateSplatParams = @{
+                        Uri     = "$($helloIDPortalBaseUrl)/api/v1/products"
+                        Method  = 'POST'
+                        Headers = $helloIDHeaders
+                        Body    = ($updateInstruction.UpdateBody | ConvertTo-Json -Depth 10)
+                    }
+                    
+                    if ($dryRun -eq $false) {
+                        $updatedProduct = Invoke-HelloIDRestMethod @updateSplatParams
+                        $productUpdatesSuccess++
+                        
+                        if ($updateInstruction.HasPropertyChanges) {
+                            $productPropertiesUpdatedCount++
                         }
-                        $changedProperties = $null
-                        $changedProperties = (Compare-Object @splatCompareProperties -PassThru)
-                        $newProperties = $changedProperties.Where( { $_.SideIndicator -eq "=>" })
+                        if ($updateInstruction.HasActionChanges) {
+                            $productActionsUpdatedCount++
+                        }
+                        
+                        if ($verboseLogging -eq $true) {
+                            Write-Verbose "Successfully updated HelloID Self service Product [$($existingProduct.name)]"
+                        }
                     }
                     else {
-                        $newProperties = @()
+                        if ($verboseLogging -eq $true) {
+                            Write-Verbose "DryRun: Would update HelloID Self service Product [$($existingProduct.name)]"
+                        }
                     }
-
-                    if (($newProperties | Measure-Object).Count -ge 1 -or $overwriteExistingProductAction -eq $true -or $addMissingProductAction -eq $true -or $removeUnconfiguredActions -eq $true -or $accessGroupUpdateBehavior -ne "None") {
-                        # Track if properties were changed
-                        $hasPropertyChanges = ($newProperties | Measure-Object).Count -ge 1
-                        $hasActionChanges = $false
+                }
+                
+                # Execute access group changes if configured
+                if ($updateInstruction.HasAccessGroupChanges) {
+                    $changes = $updateInstruction.AccessGroupChanges
+                    $groupsModified = $false
+                    
+                    # Remove groups
+                    if (($changes.ToRemove | Measure-Object).Count -gt 0) {
+                        $groupUnlinkSuccess = 0
+                        $groupUnlinkError = 0
                         
-                        # Update changed properties
-                        foreach ($newProperty in $newProperties) {
-                            $updateHelloIDSelfServiceProductBody | Add-Member -MemberType NoteProperty -Name $newProperty.Name -Value $newProperty.Value -Force
+                        if ($verboseLogging -eq $true) {
+                            Write-Verbose "Removing $(($changes.ToRemove | Measure-Object).Count) group(s) from product [$($existingProduct.name)]"
                         }
                         
-                        # Log changed properties
-                        if ($verboseLogging -eq $true -and ($newProperties | Measure-Object).Count -ge 1) {
-                            $changedPropertyNames = ($newProperties | ForEach-Object { $_.Name }) -join ', '
-                            Write-Verbose "Changed properties for product [$($existingProduct.name)]: $changedPropertyNames"
-                        }
-                        
-                        # Process actions only if we have detailed product info (i.e., when action updates are enabled)
-                        if ($null -ne $currentProductInHelloID -and ($overwriteExistingProductAction -eq $true -or $addMissingProductAction -eq $true -or $removeUnconfiguredActions -eq $true)) {
-                            $actionMessage = "processing actions for product [$($existingProduct.name)]"
-                            # Process actions
-                            $actionProperties = @("onRequest", "onApprove", "onApprove", "onDeny", "onReturn", "onWithdrawn")
-                            # Track changed actions for summary logging
-                            $updatedActionsList = [System.Collections.Generic.List[string]]::new()
-                            $addedActionsList = [System.Collections.Generic.List[string]]::new()
-                            
-                            # Process product actions based on configuration
-                            foreach ($actionType in $actionsToUpdate.Keys) {
-                                $actionMessage = "processing [$actionType] actions for product [$($existingProduct.name)]"
-                                $updatedActions = [System.Collections.Generic.list[object]]@()
-                            
-                                # Get current actions for this action type from HelloID
-                                $currentActions = $currentProductInHelloID.$actionType
-                            
-                                # Get configured action names for this action type
-                                $configuredActionNames = $actionsToUpdate[$actionType]
-                            
-                                if ($verboseLogging -eq $true) {
-                                    Write-Verbose "Processing action type [$actionType] with $(($configuredActionNames | Measure-Object).Count) configured action(s)"
-                                }
-                            
-                                # Process each configured action name
-                                foreach ($actionName in $configuredActionNames) {
-                                    $actionMessage = "processing action [$actionName] of type [$actionType] for product [$($existingProduct.name)]"
-                                    # Get the script content from the mapping
-                                    $newScriptContent = $actionScriptMapping[$actionName]
-                                
-                                    if ([string]::IsNullOrEmpty($newScriptContent)) {
-                                        if ($verboseLogging -eq $true) {
-                                            Write-Verbose "No script found in mapping for action [$actionName] - skipping"
-                                        }
-                                        continue
+                        foreach ($groupToRemove in $changes.ToRemove) {
+                            $actionMessage = "unlinking access group [$($groupToRemove.name)] from product [$($existingProduct.name)]"
+                            try {
+                                if ($dryRun -eq $false) {
+                                    $unlinkSplatParams = @{
+                                        Uri     = "$($helloIDPortalBaseUrl)/api/v1/selfserviceproducts/$($basicProductInfo.productId)/groups/$($groupToRemove.id)"
+                                        Method  = 'DELETE'
+                                        Headers = $helloIDHeaders
                                     }
-                                
-                                    # Find matching action by name in current product
-                                    $matchingCurrentAction = $currentActions | Where-Object { $_.name -eq $actionName } | Select-Object -First 1
-                                
-                                    if ($null -ne $matchingCurrentAction) {
-                                        # Action exists - compare scripts
-                                        if ($newScriptContent -ne $matchingCurrentAction.script) {
-                                            # Script differs - update with existing action id
-                                            $updatedAction = [PSCustomObject]@{
-                                                id          = $matchingCurrentAction.id
-                                                name        = $actionName
-                                                script      = $newScriptContent
-                                                agentPoolId = $matchingCurrentAction.agentPoolId
-                                                runInCloud  = $matchingCurrentAction.runInCloud
-                                            }
-                                            [void]$updatedActions.Add($updatedAction)
-                                            [void]$updatedActionsList.Add("$actionType.$actionName")
-                                        
-                                            if ($verboseLogging -eq $true) {
-                                                Write-Verbose "Action [$actionName] script differs - will update with id [$($matchingCurrentAction.id)]"
-                                            }
-                                        }
-                                        else {
-                                            # Script is the same - keep existing action with id
-                                            $unchangedAction = [PSCustomObject]@{
-                                                id          = $matchingCurrentAction.id
-                                                name        = $matchingCurrentAction.name
-                                                script      = $matchingCurrentAction.script
-                                                agentPoolId = $matchingCurrentAction.agentPoolId
-                                                runInCloud  = $matchingCurrentAction.runInCloud
-                                            }
-                                            [void]$updatedActions.Add($unchangedAction)
-                                        
-                                            if ($verboseLogging -eq $true) {
-                                                Write-Verbose "Action [$actionName] script unchanged - keeping with id [$($matchingCurrentAction.id)]"
-                                            }
-                                        }
+                                    $null = Invoke-HelloIDRestMethod @unlinkSplatParams
+                                    $groupUnlinkSuccess++
+                                    
+                                    if ($verboseLogging -eq $true) {
+                                        Write-Verbose "Successfully unlinked access group [$($groupToRemove.name)] from product [$($existingProduct.name)]"
+                                    }
+                                }
+                                else {
+                                    if ($verboseLogging -eq $true) {
+                                        Write-Verbose "DryRun: Would unlink access group [$($groupToRemove.name)] from product [$($existingProduct.name)]"
+                                    }
+                                }
+                            }
+                            catch {
+                                $groupUnlinkError++
+                                if ($verboseLogging -eq $true) {
+                                    $ex = $PSItem
+                                    if ($($ex.Exception.GetType().FullName -eq "Microsoft.PowerShell.Commands.HttpResponseException") -or
+                                        $($ex.Exception.GetType().FullName -eq "System.Net.WebException")) {
+                                        $errorObj = Resolve-HelloIDError -ErrorObject $ex
+                                        $warningMessage = "Error at Line '$($errorObj.ScriptLineNumber)': $($errorObj.Line). Error: $($errorObj.ErrorDetails)"
+                                        $errorMessage = "Error $($actionMessage). Error: $($errorObj.FriendlyMessage)"
                                     }
                                     else {
-                                        # New action - add without id (if $addMissingProductAction is true)
-                                        if ($addMissingProductAction -eq $true) {
-                                            # Get action definition from the configured product object (which has correct agent pool ID and runInCloud)
-                                            $configuredAction = $existingProduct.$actionType | Where-Object { $_.name -eq $actionName } | Select-Object -First 1
-                                            
-                                            if ($null -ne $configuredAction) {
-                                                $newAction = [PSCustomObject]@{
-                                                    id          = ""
-                                                    name        = $actionName
-                                                    script      = $newScriptContent
-                                                    agentPoolId = $configuredAction.agentPoolId
-                                                    runInCloud  = $configuredAction.runInCloud
-                                                }
-                                                [void]$updatedActions.Add($newAction)
-                                                [void]$addedActionsList.Add("$actionType.$actionName")
-                                            
-                                                if ($verboseLogging -eq $true) {
-                                                    Write-Verbose "Action [$actionName] is new - will add with agent pool [$($configuredAction.agentPoolId)] and runInCloud [$($configuredAction.runInCloud)]"
-                                                }
-                                            }
-                                            else {
-                                                if ($verboseLogging -eq $true) {
-                                                    Write-Verbose "Action [$actionName] not found in configured product - skipping"
-                                                }
-                                            }
-                                        }
-                                        else {
-                                            if ($verboseLogging -eq $true) {
-                                                Write-Verbose "Action [$actionName] is new but addMissingProductAction is false - skipping"
-                                            }
-                                        }
+                                        $warningMessage = "Error at Line '$($ex.InvocationInfo.ScriptLineNumber)': $($ex.InvocationInfo.Line). Error: $($ex.Exception.Message)"
+                                        $errorMessage = "Error $($actionMessage). Error: $($ex.Exception.Message)"
                                     }
+                                    Write-Verbose $warningMessage
+                                    Write-Verbose $errorMessage
                                 }
-                            
-                                # Add actions from current product that are NOT in the configuration
-                                # Behavior depends on $removeUnconfiguredActions setting
-                                if ($removeUnconfiguredActions -eq $false) {
-                                    # Preserve unconfigured actions (default safe behavior)
-                                    foreach ($currentAction in $currentActions) {
-                                        $isConfigured = $configuredActionNames | Where-Object { $_ -eq $currentAction.name }
-                                        if ($null -eq $isConfigured) {
-                                            # Action not in configuration - keep as-is
-                                            $preservedAction = [PSCustomObject]@{
-                                                id          = $currentAction.id
-                                                name        = $currentAction.name
-                                                script      = $currentAction.script
-                                                agentPoolId = $currentAction.agentPoolId
-                                                runInCloud  = $currentAction.runInCloud
-                                            }
-                                            [void]$updatedActions.Add($preservedAction)
-                                        
-                                            if ($verboseLogging -eq $true) {
-                                                Write-Verbose "Action [$($currentAction.name)] not in configuration - preserving"
-                                            }
-                                        }
-                                    }
-                                }
-                                else {
-                                    # Remove unconfigured actions (dangerous - scripts are lost permanently)
-                                    $removedActionsList = [System.Collections.Generic.List[string]]::new()
-                                    foreach ($currentAction in $currentActions) {
-                                        $isConfigured = $configuredActionNames | Where-Object { $_ -eq $currentAction.name }
-                                        if ($null -eq $isConfigured) {
-                                            # Action not in configuration - will be removed (not added to $updatedActions)
-                                            [void]$removedActionsList.Add("$actionType.$($currentAction.name)")
-                                        
-                                            if ($verboseLogging -eq $true) {
-                                                Write-Verbose "Action [$($currentAction.name)] not in configuration - will be REMOVED"
-                                            }
-                                        }
-                                    }
-                                    
-                                    if (($removedActionsList | Measure-Object).Count -gt 0) {
-                                        $hasActionChanges = $true
-                                        if ($verboseLogging -eq $true) {
-                                            $removedActionsString = $removedActionsList -join ', '
-                                            Write-Verbose "Removed actions for product [$($existingProduct.name)]: $removedActionsString"
-                                        }
-                                    }
-                                }
-                            
-                                # Add the processed actions to the update body
-                                $updateHelloIDSelfServiceProductBody | Add-Member -MemberType NoteProperty -Name $actionType -Value $updatedActions -Force
-                            }
-                        
-                            # Preserve action types that are NOT in the configuration
-                            foreach ($actionProperty in $actionProperties) {
-                                if ($actionProperty -notin $actionsToUpdate.Keys) {
-                                    # Keep existing actions for this type as-is
-                                    if (($currentProductInHelloID.$actionProperty | Measure-Object).Count -gt 0) {
-                                        $updateHelloIDSelfServiceProductBody | Add-Member -MemberType NoteProperty -Name $actionProperty -Value $currentProductInHelloID.$actionProperty -Force
-                                    
-                                        if ($verboseLogging -eq $true) {
-                                            Write-Verbose "Action type [$actionProperty] not in configuration - preserving all $(($currentProductInHelloID.$actionProperty | Measure-Object).Count) action(s)"
-                                        }
-                                    }
-                                }
-                            }
-
-                            # Log summary of changed actions
-                            if ($verboseLogging -eq $true) {
-                                if (($updatedActionsList | Measure-Object).Count -gt 0) {
-                                    $updatedActionsString = $updatedActionsList -join ', '
-                                    Write-Verbose "Updated actions for product [$($existingProduct.name)]: $updatedActionsString"
-                                }
-                                if (($addedActionsList | Measure-Object).Count -gt 0) {
-                                    $addedActionsString = $addedActionsList -join ', '
-                                    Write-Verbose "Added actions for product [$($existingProduct.name)]: $addedActionsString"
-                                }
-                            }
-                            
-                            # Track if any actions were changed
-                            if (($updatedActionsList | Measure-Object).Count -gt 0 -or ($addedActionsList | Measure-Object).Count -gt 0) {
-                                $hasActionChanges = $true
-                            }
-                        }
-
-                        # Handle access groups if configured for update - via separate API calls
-                        $accessGroupsModified = $false
-                        if ($accessGroupUpdateBehavior -ne "None" -and ($existingProduct.accessGroups | Measure-Object).Count -gt 0) {
-                            $actionMessage = "updating access groups for product [$($existingProduct.name)] with behavior [$accessGroupUpdateBehavior]"
-                            # For Replace mode: determine which groups to add/remove
-                            if ($accessGroupUpdateBehavior -eq "Replace" -and $null -ne $sourceProduct -and $null -ne $sourceProduct.accessGroups) {
-                                # Get current and desired group IDs
-                                $currentGroupIds = @($sourceProduct.accessGroups | ForEach-Object { $_.id })
-                                $desiredGroupIds = @($existingProduct.accessGroups | ForEach-Object { $_.id })
-                                
-                                # Determine which groups to remove (in current but not in desired)
-                                $groupsToRemove = $sourceProduct.accessGroups | Where-Object { $_.id -notin $desiredGroupIds }
-                                
-                                # Determine which groups to add (in desired but not in current)
-                                $groupsToAdd = $existingProduct.accessGroups | Where-Object { $_.id -notin $currentGroupIds }
-                                
-                                # Check if any changes are needed
-                                if (($groupsToRemove | Measure-Object).Count -eq 0 -and ($groupsToAdd | Measure-Object).Count -eq 0) {
-                                    # No changes needed - all desired groups are already present, no extra groups exist
-                                    if ($verboseLogging -eq $true) {
-                                        Write-Verbose "Replace behavior: Access groups already match configuration for product [$($existingProduct.name)] - skipping"
-                                    }
-                                }
-                                else {
-                                    # Remove groups that shouldn't be there
-                                    $groupUnlinkSuccess = 0
-                                    $groupUnlinkError = 0
-                                    $actionMessage = "removing access groups from product [$($existingProduct.name)]"
-                                    
-                                    if (($groupsToRemove | Measure-Object).Count -gt 0) {
-                                        if ($verboseLogging -eq $true) {
-                                            Write-Verbose "Replace behavior: Removing $(($groupsToRemove | Measure-Object).Count) group(s) from product [$($existingProduct.name)]"
-                                        }
-                                        
-                                        foreach ($groupToRemove in $groupsToRemove) {
-                                            $actionMessage = "unlinking access group [$($groupToRemove.name)] from product [$($existingProduct.name)]"
-                                            try {
-                                                if ($dryRun -eq $false) {
-                                                    $unlinkAccessGroupToProductSplatParams = @{
-                                                        Uri     = "$($helloIDPortalBaseUrl)/api/v1/selfserviceproducts/$($sourceProduct.productId)/groups/$($groupToRemove.id)"
-                                                        Method  = 'DELETE'
-                                                        Headers = $helloIDHeaders
-                                                    }
-                                                    $unlinkedAccessGroupToProduct = Invoke-HelloIDRestMethod @unlinkAccessGroupToProductSplatParams
-                                                    $groupUnlinkSuccess++
-                                                    
-                                                    if ($verboseLogging -eq $true) {
-                                                        Write-Verbose "Successfully unlinked access group [$($groupToRemove.name)] from product [$($existingProduct.name)]"
-                                                    }
-                                                }
-                                                else {
-                                                    if ($verboseLogging -eq $true) {
-                                                        Write-Verbose "DryRun: Would unlink access group [$($groupToRemove.name)] from product [$($existingProduct.name)]"
-                                                    }
-                                                }
-                                            }
-                                            catch {
-                                                $groupUnlinkError++
-                                                if ($verboseLogging -eq $true) {
-                                                    $ex = $PSItem
-                                                    if ($($ex.Exception.GetType().FullName -eq "Microsoft.PowerShell.Commands.HttpResponseException") -or
-                                                        $($ex.Exception.GetType().FullName -eq "System.Net.WebException")) {
-                                                        $errorObj = Resolve-HelloIDError -ErrorObject $ex
-                                                        $warningMessage = "Error at Line '$($errorObj.ScriptLineNumber)': $($errorObj.Line). Error: $($errorObj.ErrorDetails)"
-                                                        $errorMessage = "Error $($actionMessage). Error: $($errorObj.FriendlyMessage)"
-                                                    }
-                                                    else {
-                                                        $warningMessage = "Error at Line '$($ex.InvocationInfo.ScriptLineNumber)': $($ex.InvocationInfo.Line). Error: $($ex.Exception.Message)"
-                                                        $errorMessage = "Error $($actionMessage). Error: $($ex.Exception.Message)"
-                                                    }
-                                                    Write-Verbose $warningMessage
-                                                    Write-Verbose $errorMessage
-                                                }
-                                            }
-                                        }
-                                        
-                                        if ($verboseLogging -eq $true -and $dryRun -eq $false) {
-                                            Write-Verbose "Removed $groupUnlinkSuccess of $(($groupsToRemove | Measure-Object).Count) unwanted group(s) from product [$($existingProduct.name)]"
-                                        }
-                                    }
-                                    
-                                    # Add groups that should be there
-                                    $groupLinkSuccess = 0
-                                    $groupLinkError = 0
-                                    $actionMessage = "adding access groups to product [$($existingProduct.name)]"
-                                    
-                                    if (($groupsToAdd | Measure-Object).Count -gt 0) {
-                                        if ($verboseLogging -eq $true) {
-                                            Write-Verbose "Replace behavior: Adding $(($groupsToAdd | Measure-Object).Count) group(s) to product [$($existingProduct.name)]"
-                                        }
-                                        
-                                        foreach ($groupToAdd in $groupsToAdd) {
-                                            $actionMessage = "linking access group [$($groupToAdd.name)] to product [$($existingProduct.name)]"
-                                            try {
-                                                if ($dryRun -eq $false) {
-                                                    $linkAccessGroupToProductBody = [PSCustomObject]@{
-                                                        groupGuid = $groupToAdd.id
-                                                    }
-
-                                                    $linkAccessGroupToProductSplatParams = @{
-                                                        Uri     = "$($helloIDPortalBaseUrl)/api/v1/selfserviceproducts/$($existingProduct.productId)/groups"
-                                                        Method  = 'POST'
-                                                        Headers = $helloIDHeaders
-                                                        Body    = ($linkAccessGroupToProductBody | ConvertTo-Json -Depth 10)
-                                                    }
-
-                                                    $linkedAccessGroupToProduct = Invoke-HelloIDRestMethod @linkAccessGroupToProductSplatParams
-                                                    $groupLinkSuccess++
-                                                    
-                                                    if ($verboseLogging -eq $true) {
-                                                        Write-Verbose "Successfully linked access group [$($groupToAdd.name)] to product [$($existingProduct.name)]"
-                                                    }
-                                                }
-                                                else {
-                                                    if ($verboseLogging -eq $true) {
-                                                        Write-Verbose "DryRun: Would link access group [$($groupToAdd.name)] to product [$($existingProduct.name)]"
-                                                    }
-                                                }
-                                            }
-                                            catch {
-                                                $groupLinkError++
-                                                if ($verboseLogging -eq $true) {
-                                                    $ex = $PSItem
-                                                    if ($($ex.Exception.GetType().FullName -eq "Microsoft.PowerShell.Commands.HttpResponseException") -or
-                                                        $($ex.Exception.GetType().FullName -eq "System.Net.WebException")) {
-                                                        $errorObj = Resolve-HelloIDError -ErrorObject $ex
-                                                        $warningMessage = "Error at Line '$($errorObj.ScriptLineNumber)': $($errorObj.Line). Error: $($errorObj.ErrorDetails)"
-                                                        $errorMessage = "Error $($actionMessage). Error: $($errorObj.FriendlyMessage)"
-                                                    }
-                                                    else {
-                                                        $warningMessage = "Error at Line '$($ex.InvocationInfo.ScriptLineNumber)': $($ex.InvocationInfo.Line). Error: $($ex.Exception.Message)"
-                                                        $errorMessage = "Error $($actionMessage). Error: $($ex.Exception.Message)"
-                                                    }
-                                                    Write-Verbose $warningMessage
-                                                    Write-Verbose $errorMessage
-                                                }
-                                            }
-                                        }
-                                        
-                                        if ($verboseLogging -eq $true -and $dryRun -eq $false) {
-                                            Write-Verbose "Replace behavior: Added $groupLinkSuccess of $(($groupsToAdd | Measure-Object).Count) missing group(s) to product [$($existingProduct.name)]"
-                                        }
-                                    }
-                                    
-                                    $accessGroupsModified = ($groupLinkSuccess -gt 0 -or $groupUnlinkSuccess -gt 0)
-                                }
-                            }
-                            # For Add mode: add groups that don't exist yet
-                            elseif ($accessGroupUpdateBehavior -eq "Add") {
-                                $groupLinkSuccess = 0
-                                $groupLinkError = 0
-                                $groupLinkSkipped = 0
-                                $actionMessage = "adding access groups to product [$($existingProduct.name)]"
-                                
-                                foreach ($configuredGroup in $existingProduct.accessGroups) {
-                                    $actionMessage = "checking if access group [$($configuredGroup.name)] needs to be added to product [$($existingProduct.name)]"
-                                    # Check if group already exists to avoid duplicates
-                                    if ($null -ne $sourceProduct -and $null -ne $sourceProduct.accessGroups) {
-                                        $groupExists = $sourceProduct.accessGroups | Where-Object { $_.id -eq $configuredGroup.id }
-                                        if ($null -ne $groupExists) {
-                                            $groupLinkSkipped++
-                                            if ($verboseLogging -eq $true) {
-                                                Write-Verbose "Access group [$($configuredGroup.name)] already linked to product - skipping"
-                                            }
-                                            continue
-                                        }
-                                    }
-                                    
-                                    try {
-                                        if ($dryRun -eq $false) {
-                                            $linkAccessGroupToProductBody = [PSCustomObject]@{
-                                                groupGuid = $configuredGroup.id
-                                            }
-
-                                            $linkAccessGroupToProductSplatParams = @{
-                                                Uri     = "$($helloIDPortalBaseUrl)/api/v1/selfserviceproducts/$($existingProduct.productId)/groups"
-                                                Method  = 'POST'
-                                                Headers = $helloIDHeaders
-                                                Body    = ($linkAccessGroupToProductBody | ConvertTo-Json -Depth 10)
-                                            }
-
-                                            $linkedAccessGroupToProduct = Invoke-HelloIDRestMethod @linkAccessGroupToProductSplatParams
-                                            $groupLinkSuccess++
-                                            
-                                            if ($verboseLogging -eq $true) {
-                                                Write-Verbose "Successfully linked access group [$($configuredGroup.name)] to product [$($existingProduct.name)]"
-                                            }
-                                        }
-                                        else {
-                                            if ($verboseLogging -eq $true) {
-                                                Write-Verbose "DryRun: Would link access group [$($configuredGroup.name)] to product [$($existingProduct.name)]"
-                                            }
-                                        }
-                                    }
-                                    catch {
-                                        $groupLinkError++
-                                        if ($verboseLogging -eq $true) {
-                                            $ex = $PSItem
-                                            if ($($ex.Exception.GetType().FullName -eq "Microsoft.PowerShell.Commands.HttpResponseException") -or
-                                                $($ex.Exception.GetType().FullName -eq "System.Net.WebException")) {
-                                                $errorObj = Resolve-HelloIDError -ErrorObject $ex
-                                                $warningMessage = "Error at Line '$($errorObj.ScriptLineNumber)': $($errorObj.Line). Error: $($errorObj.ErrorDetails)"
-                                                $errorMessage = "Error $($actionMessage). Error: $($errorObj.FriendlyMessage)"
-                                            }
-                                            else {
-                                                $warningMessage = "Error at Line '$($ex.InvocationInfo.ScriptLineNumber)': $($ex.InvocationInfo.Line). Error: $($ex.Exception.Message)"
-                                                $errorMessage = "Error $($actionMessage). Error: $($ex.Exception.Message)"
-                                            }
-                                            Write-Verbose $warningMessage
-                                            Write-Verbose $errorMessage
-                                        }
-                                    }
-                                }
-                                
-                                if ($verboseLogging -eq $true -and $dryRun -eq $false) {
-                                    Write-Verbose "Add behavior: Linked $groupLinkSuccess new group(s), skipped $groupLinkSkipped existing group(s) for product [$($existingProduct.name)]"
-                                }
-                                
-                                $accessGroupsModified = ($groupLinkSuccess -gt 0)
                             }
                         }
                         
-                        if ($hasPropertyChanges -or $hasActionChanges) {
-                            # Update HelloID Self service Product
-                            $actionMessage = "updating HelloID Self service Product [$($existingProduct.name)]"
-                            $updateHelloIDSelfServiceProductSplatParams = @{
-                                Uri     = "$($helloIDPortalBaseUrl)/api/v1/products"
-                                Method  = 'POST'
-                                Headers = $helloIDHeaders
-                                Body    = ($updateHelloIDSelfServiceProductBody | ConvertTo-Json -Depth 10)
-                            }
-
-                            if ($dryRun -eq $false) {
-                                $updatedHelloIDSelfServiceProduct = Invoke-HelloIDRestMethod @updateHelloIDSelfServiceProductSplatParams
-
-                                if ($verboseLogging -eq $true) {
-                                    Write-Verbose "Successfully updated HelloID Self service Product [$($updateHelloIDSelfServiceProductBody.Name)]"
-                                }
-        
-                                # Track what was actually updated
-                                if ($hasPropertyChanges) {
-                                    $productPropertiesUpdatedCount++
-                                }
-                                if ($hasActionChanges) {
-                                    $productActionsUpdatedCount++
-                                }
-                                if ($accessGroupsModified) {
-                                    $productAccessGroupsUpdatedCount++
-                                }
-        
-                                $productUpdatesSuccess++
-                            }
-                            else {
-                                Write-StatusMessage -Event Warning "DryRun: Would update HelloID Self service Product [$($updateHelloIDSelfServiceProductBody.name)]"
-                            }
-                        }
-                        else {
-                            if ($dryRun -eq $false) {
-                                # No actual changes detected
-                                $productUpdatesSkipped++
-        
-                                if ($verboseLogging -eq $true) {
-                                    Write-Verbose "No changes to HelloID Self service Product [$($updateHelloIDSelfServiceProductBody.Name)]"
-                                }
-                            }
-                            else {
-                                Write-StatusMessage -Event Warning "DryRun: No changes to HelloID Self service Product [$($updateHelloIDSelfServiceProductBody.Name)]"
-                            } 
+                        if ($groupUnlinkSuccess -gt 0) {
+                            $groupsModified = $true
                         }
                     }
-                    else {
-                        # Update settings are enabled but no changes detected (no property changes and no action/access group updates needed)
-                        if ($dryRun -eq $false) {
-                            $productUpdatesSkipped++
-                                
-                            if ($verboseLogging -eq $true) {
-                                Write-Verbose "No changes to HelloID Self service Product [$($existingProduct.Name)] (property update enabled but no differences found)"
+                    
+                    # Add groups
+                    if (($changes.ToAdd | Measure-Object).Count -gt 0) {
+                        $groupLinkSuccess = 0
+                        $groupLinkError = 0
+                        
+                        if ($verboseLogging -eq $true) {
+                            Write-Verbose "Adding $(($changes.ToAdd | Measure-Object).Count) group(s) to product [$($existingProduct.name)]"
+                        }
+                        
+                        foreach ($groupToAdd in $changes.ToAdd) {
+                            $actionMessage = "linking access group [$($groupToAdd.name)] to product [$($existingProduct.name)]"
+                            try {
+                                if ($dryRun -eq $false) {
+                                    $linkBody = [PSCustomObject]@{
+                                        groupGuid = $groupToAdd.id
+                                    }
+                                    
+                                    $linkSplatParams = @{
+                                        Uri     = "$($helloIDPortalBaseUrl)/api/v1/selfserviceproducts/$($basicProductInfo.productId)/groups"
+                                        Method  = 'POST'
+                                        Headers = $helloIDHeaders
+                                        Body    = ($linkBody | ConvertTo-Json -Depth 10)
+                                    }
+                                    
+                                    $null = Invoke-HelloIDRestMethod @linkSplatParams
+                                    $groupLinkSuccess++
+                                    
+                                    if ($verboseLogging -eq $true) {
+                                        Write-Verbose "Successfully linked access group [$($groupToAdd.name)] to product [$($existingProduct.name)]"
+                                    }
+                                }
+                                else {
+                                    if ($verboseLogging -eq $true) {
+                                        Write-Verbose "DryRun: Would link access group [$($groupToAdd.name)] to product [$($existingProduct.name)]"
+                                    }
+                                }
+                            }
+                            catch {
+                                $groupLinkError++
+                                if ($verboseLogging -eq $true) {
+                                    $ex = $PSItem
+                                    if ($($ex.Exception.GetType().FullName -eq "Microsoft.PowerShell.Commands.HttpResponseException") -or
+                                        $($ex.Exception.GetType().FullName -eq "System.Net.WebException")) {
+                                        $errorObj = Resolve-HelloIDError -ErrorObject $ex
+                                        $warningMessage = "Error at Line '$($errorObj.ScriptLineNumber)': $($errorObj.Line). Error: $($errorObj.ErrorDetails)"
+                                        $errorMessage = "Error $($actionMessage). Error: $($errorObj.FriendlyMessage)"
+                                    }
+                                    else {
+                                        $warningMessage = "Error at Line '$($ex.InvocationInfo.ScriptLineNumber)': $($ex.InvocationInfo.Line). Error: $($ex.Exception.Message)"
+                                        $errorMessage = "Error $($actionMessage). Error: $($ex.Exception.Message)"
+                                    }
+                                    Write-Verbose $warningMessage
+                                    Write-Verbose $errorMessage
+                                }
                             }
                         }
-                        else {
-                            if ($verboseLogging -eq $true) {
-                                Write-Verbose "DryRun: No changes to HelloID Self service Product [$($existingProduct.Name)]"
-                            }
+                        
+                        if ($groupLinkSuccess -gt 0) {
+                            $groupsModified = $true
+                        }
+                    }
+                    
+                    # Track access group updates
+                    if ($dryRun -eq $false -and $groupsModified) {
+                        $productAccessGroupsUpdatedCount++
+                        # Count as successful update (even if only access groups changed)
+                        if (-not $updateInstruction.HasPropertyChanges -and -not $updateInstruction.HasActionChanges) {
+                            $productUpdatesSuccess++
                         }
                     }
                 }
@@ -3312,8 +3740,8 @@ try {
     }
     else {
         if ($updateThresholdExceeded -eq $false) {
-            Write-StatusMessage -Event Warning -Message "DryRun: Would update [$(($existingProducts | Measure-Object).Count)] HelloID Self service Products"
-            Write-StatusMessage -Event Warning -Message "DryRun: Would update [$(($existingProducts | Measure-Object).Count)] HelloID Self service Products"
+            Write-StatusMessage -Event Warning -Message "DryRun: Would update [$(($productsNeedingUpdate | Measure-Object).Count)] HelloID Self service Products"
+            Write-SummaryMessage -Event Warning -Message "DryRun: Would update [$(($productsNeedingUpdate | Measure-Object).Count)] HelloID Self service Products"
         }
     }
 
@@ -3370,12 +3798,12 @@ try {
         }
         
         if ($updateThresholdExceeded) {
-            Write-StatusMessage -Event "Error" -Message "  - Update threshold exceeded: Would update [$(($existingProducts | Measure-Object).Count)] products, but threshold is set to [$updateThreshold]"
+            Write-StatusMessage -Event "Error" -Message "  - Update threshold exceeded: Would update [$(($productsNeedingUpdate | Measure-Object).Count)] products (with actual changes), but threshold is set to [$updateThreshold]"
             if ($dryRun -eq $false) {
-                Write-SummaryMessage -Event "Failed" -Message "Update threshold exceeded: Would update [$(($existingProducts | Measure-Object).Count)] products, but threshold is set to [$updateThreshold]. Increase threshold or investigate why so many products would be updated."
+                Write-SummaryMessage -Event "Failed" -Message "Update threshold exceeded: Would update [$(($productsNeedingUpdate | Measure-Object).Count)] products (with actual changes), but threshold is set to [$updateThreshold]. Increase threshold or investigate why so many products would be updated."
             }
             else {
-                Write-SummaryMessage -Event "Warning" -Message "DryRun: Update threshold would be exceeded: Would update [$(($existingProducts | Measure-Object).Count)] products, but threshold is set to [$updateThreshold]"
+                Write-SummaryMessage -Event "Warning" -Message "DryRun: Update threshold would be exceeded: Would update [$(($productsNeedingUpdate | Measure-Object).Count)] products (with actual changes), but threshold is set to [$updateThreshold]"
             }
         }
         
