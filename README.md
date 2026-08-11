@@ -173,8 +173,8 @@ Controls which groups are synchronized:
 | Variable | Description | Default |
 | -------- | ----------- | ------- |
 | `$commands` | PowerShell commands to import from Exchange Online module | `@("Get-User", "Get-DistributionGroup")` |
-| `$groupPropertiesToRetrieve` | Array of group properties to retrieve | See script for full list |
-| `$exchangeDistributionGroupsFilter` | Filter which groups to sync (e.g., `"DisplayName -like 'DistributionGroup*'"`) | `$null` (all groups) |
+| `$exchangeOnlineGroupPropertiesToRetrieve` | Array of group properties to retrieve | See script for full list |
+| `$exchangeOnlineGroupsFilter` | Filter which groups to sync (e.g., `"DisplayName -like 'DistributionGroup*'"`) | `$null` (all groups) |
 
 #### Product Identification
 
