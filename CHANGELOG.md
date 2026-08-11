@@ -5,11 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.0.2] - 2026-08-11
+
+### Fixed
+
+- **Action Preservation on Property Updates**: Fixed critical issue where product actions were lost when updating only product properties (name, description, etc.) without action update settings enabled. The script now correctly preserves all existing actions during property-only updates.
+
 ## [3.0.1] - 2026-07-29
 
 ### Fixed
 - **CRITICAL**: Corrected `OwnershipMaxDuration` description from "days" to "seconds" with correct value (31536000 seconds = 365 days). Previous incorrect value of 365 would have resulted in products expiring after only 6 minutes instead of 1 year.
-- Update Threshold comment now correctly mentions that it applies when actions or access groups updates are enabled, not only when `$overwriteExistingProduct = $true`
+- Update Threshold comment now correctly mentions that it applies when property updates, action updates, or access group updates are enabled
 
 ### Improved
 - Access Groups documentation expanded with clearer explanation that source can be any configured source in HelloID (e.g., "AzureAD", "ActiveDirectory", etc.), not just "local" or "AzureAD"
