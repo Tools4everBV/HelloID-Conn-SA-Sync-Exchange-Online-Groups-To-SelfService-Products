@@ -845,7 +845,7 @@ try {
     # Microsoft docs: https://learn.microsoft.com/en-us/powershell/module/exchange/remove-distributiongroupmember?view=exchange-ps
     $actionMessage = "removing Exchange Online user [$($exchangeUser.DisplayName) ($($exchangeUser.Guid))] from Exchange Online group [$($exchangeGroup.DisplayName) ($($exchangeGroup.Guid))]"
     $removeExchangeOnlineUserFromGroupSplatParams = @{
-        Identity                        = $exchangeDistributionGroup.guid
+        Identity                        = $exchangeGroup.guid
         Member                          = $exchangeUser.guid
         BypassSecurityGroupManagerCheck = $true
         Confirm                         = $false
